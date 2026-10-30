@@ -47,9 +47,6 @@ fold_seed="1"
 cis_window="100000"
 fold_file=${cv_folds_dir}"gtex_individuals_"${n_folds}"_folds_seed_"${fold_seed}".txt"
 
-tissue="Whole_Blood"
-gibbs_input_summary_file=${gibbs_input_dir}${tissue}"_gibbs_input_summary.txt"
-
 
 #####################
 # 0. Assign every genotyped GTEx individual to a cross-validation fold (once, shared by all tissues)
@@ -58,6 +55,14 @@ if false; then
 mkdir -p ${cv_folds_dir}
 sh generate_cross_validation_folds.sh ${gtex_plink_stem}"1.fam" ${n_folds} ${fold_seed} ${fold_file}
 fi
+
+
+
+#####################
+# Tissue-specific settings
+#####################
+tissue="Whole_Blood"
+gibbs_input_summary_file=${gibbs_input_dir}${tissue}"_gibbs_input_summary.txt"
 
 
 #####################
@@ -79,6 +84,7 @@ for held_out_fold in $(seq 1 ${n_folds}); do
 	sbatch run_eqtl_mixture_prior_gibbs.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}"_fold_"${held_out_fold}
 done
 fi
+
 
 
 #####################
