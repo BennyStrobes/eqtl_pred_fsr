@@ -45,6 +45,10 @@ visualization_dir=${output_root}"visualization/"
 n_folds="4"
 fold_seed="1"
 cis_window="100000"
+# Gibbs sampler: total iterations, burn-in, and thinning of the retained samples ((n_iters - burn_in) / thin retained)
+n_iters="10000"
+burn_in="5000"
+thin="5"
 fold_file=${cv_folds_dir}"gtex_individuals_"${n_folds}"_folds_seed_"${fold_seed}".txt"
 
 
@@ -81,9 +85,10 @@ fi
 if false; then
 mkdir -p ${gibbs_results_dir}
 for held_out_fold in $(seq 1 ${n_folds}); do
-	sbatch run_eqtl_mixture_prior_gibbs.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}"_fold_"${held_out_fold}
+	sbatch run_eqtl_mixture_prior_gibbs.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}"_fold_"${held_out_fold} ${n_iters} ${burn_in} ${thin}
 done
 fi
+
 
 
 
@@ -96,6 +101,7 @@ for held_out_fold in $(seq 1 ${n_folds}); do
 	sbatch evaluate_held_out_expression_prediction.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}"_fold_"${held_out_fold} ${held_out_evaluation_dir}${tissue}"_fold_"${held_out_fold}"_held_out_evaluation.txt"
 done
 fi
+
 
 
 #####################

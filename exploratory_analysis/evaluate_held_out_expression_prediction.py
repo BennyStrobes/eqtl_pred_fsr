@@ -1,6 +1,8 @@
 import sys
 import os
 import argparse
+import shutil
+import tempfile
 import numpy as np
 from scipy import stats
 from scipy.optimize import minimize_scalar
@@ -221,7 +223,9 @@ columns += ['expected_cis_h2', 'expected_genetic_r', 'predicted_r_variance', 'ge
             'posterior_cis_h2_train', 'posterior_cis_h2_train_lb', 'posterior_cis_h2_train_ub']
 for split in ['train', 'test']:
     columns += ['cis_snp_h2_' + split, 'cis_snp_h2_pvalue_' + split, 'cis_snp_h2_he_' + split, 'cis_snp_h2_he_se_' + split, 'cis_snp_h2_he_pvalue_' + split]
-t = open(args.output_file, 'w')
+# Written to a node-local temporary file and copied to --output_file at the end: writing in place on the shared file system left a block
+# of NUL bytes in the middle of one output file (at the same offset in two runs)
+t = tempfile.NamedTemporaryFile(mode='w', suffix='_held_out_evaluation.txt', delete=False)
 t.write('\t'.join(columns) + '\n')
 
 ptr = samples['gene_pair_ptr']
@@ -284,3 +288,18 @@ for chrom_num in np.unique(gene_chroms):
     t.flush()
     gibbs_input.close()
 t.close()
+shutil.copyfile(t.name, args.output_file)
+os.remove(t.name)
+
+# Check the copy: no NUL bytes, one row per gene, every row with all columns
+with open(args.output_file, 'rb') as f:
+    content = f.read()
+if b'\0' in content:
+    raise ValueError('output file contains NUL bytes: ' + args.output_file)
+lines = content.decode().rstrip('\n').split('\n')
+if len(lines) != len(gene_ids) + 1:
+    raise ValueError('output file has ' + str(len(lines) - 1) + ' rows for ' + str(len(gene_ids)) + ' genes: ' + args.output_file)
+for line_num, line in enumerate(lines):
+    if len(line.split('\t')) != len(columns):
+        raise ValueError('line ' + str(line_num + 1) + ' of ' + args.output_file + ' does not have ' + str(len(columns)) + ' columns')
+print('wrote and checked ' + str(len(gene_ids)) + ' rows', flush=True)
