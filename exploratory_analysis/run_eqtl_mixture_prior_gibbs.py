@@ -4,10 +4,14 @@ import argparse
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eqtl_mixture_prior_gibbs import EQTL_MIXTURE_PRIOR_GIBBS
+from eqtl_mixture_prior_tempered_gibbs import EQTL_MIXTURE_PRIOR_TEMPERED_GIBBS
+from eqtl_mixture_prior_gwfm_tempered_gibbs import EQTL_MIXTURE_PRIOR_GWFM_TEMPERED_GIBBS
 from posterior_beta_samples import save_posterior_beta_samples
 
 # Fit the spike and two slab eQTL prior Gibbs sampler (eqtl_mixture_prior_gibbs.py) to one GTEx tissue, training on the individuals not in
-# --held_out_fold (README.md, sections 3 to 6)
+# --held_out_fold (README.md, sections 3 to 6). With --tempered, the same model is fit by the tempered Gibbs sampler of
+# eqtl_mixture_prior_tempered_gibbs.py (README.md, section 5b) instead, or with --tempered --tgs_mode gwfm by the GWFM-style sampler of
+# eqtl_mixture_prior_gwfm_tempered_gibbs.py (section 5c); the outputs have the same format (give each its own --output_stem).
 # Input: the summary file of prepare_gtex_tissue_data_for_gibbs.py and the fold file of generate_cross_validation_folds.py
 # Training-fold variant filter: a gene's cis variants with MAF >= min_maf and non-zero variance in the training individuals. Genes with no
 # such variant are dropped.
@@ -131,6 +135,18 @@ parser.add_argument('--min_maf', type=float, default=0.01)  # training-fold mino
 parser.add_argument('--chromosomes', type=int, nargs='+', default=None)  # only these chromosomes (for testing)
 parser.add_argument('--max_genes', type=int, default=None)  # only the first max_genes genes (for testing)
 parser.add_argument('--seed', type=int, default=1)
+parser.add_argument('--tempered', action='store_true')  # fit with a tempered Gibbs sampler (see --tgs_mode)
+parser.add_argument('--tgs_mode', type=str, default='full', choices=['full', 'gwfm'])  # tempered only: full (eqtl_mixture_prior_tempered_gibbs.py) or gwfm (eqtl_mixture_prior_gwfm_tempered_gibbs.py)
+parser.add_argument('--tgs_epsilon', type=float, default=0.5)  # tempered only: weight of the uniform component of the tempered conditional
+parser.add_argument('--tgs_sub_steps_per_snp', type=float, default=1.0)  # tempered only: sub-steps per sweep and gene, per variant of the gene
+parser.add_argument('--tgs_r2_update_threshold', type=float, default=0.01)  # tempered only: LD r^2 above which a move updates a variant's selection weight (0 = exact)
+parser.add_argument('--tgs_selection_tolerance', type=float, default=1e-3)  # tempered only: relative error allowed on LD neighbours' selection weights before recomputing them (0 = exact)
+parser.add_argument('--tgs_window_sweeps', type=int, default=30)  # tempered only: sweeps pooled for the hyper-parameters' expected sufficient statistics
+parser.add_argument('--gwfm_interval', type=int, default=10)  # gwfm only: TGS blocks every this many iterations
+parser.add_argument('--gwfm_r2_threshold', type=float, default=0.95)  # gwfm only: LD r^2 defining a variant's set
+parser.add_argument('--gwfm_pip_threshold', type=float, default=0.05)  # gwfm only: running PIP a variant needs for its block
+parser.add_argument('--gwfm_steps_per_snp', type=float, default=10.0)  # gwfm only: sub-steps per block, per member of the set
+parser.add_argument('--gwfm_min_steps', type=int, default=20)  # gwfm only: minimum sub-steps per block
 args = parser.parse_args()
 
 print('settings: ' + ' '.join(key + '=' + str(value) for key, value in vars(args).items()), flush=True)
@@ -140,7 +156,13 @@ genotype_index_to_fold = load_in_fold_file(args.fold_file)
 data = load_in_training_data(args.gibbs_input_summary_file, genotype_index_to_fold, args.held_out_fold, args.min_maf, args.chromosomes, args.max_genes)
 
 # Fit
-model = EQTL_MIXTURE_PRIOR_GIBBS(n_iters=args.n_iters, burn_in=args.burn_in, thin=args.thin, dirichlet_alpha=args.dirichlet_alpha, inverse_gamma_a=args.inverse_gamma_a, inverse_gamma_b=args.inverse_gamma_b, seed=args.seed)
+model_args = dict(n_iters=args.n_iters, burn_in=args.burn_in, thin=args.thin, dirichlet_alpha=args.dirichlet_alpha, inverse_gamma_a=args.inverse_gamma_a, inverse_gamma_b=args.inverse_gamma_b, seed=args.seed)
+if args.tempered and args.tgs_mode == 'gwfm':
+    model = EQTL_MIXTURE_PRIOR_GWFM_TEMPERED_GIBBS(gwfm_interval=args.gwfm_interval, gwfm_r2_threshold=args.gwfm_r2_threshold, gwfm_pip_threshold=args.gwfm_pip_threshold, gwfm_steps_per_snp=args.gwfm_steps_per_snp, gwfm_min_steps=args.gwfm_min_steps, **model_args)
+elif args.tempered:
+    model = EQTL_MIXTURE_PRIOR_TEMPERED_GIBBS(tgs_epsilon=args.tgs_epsilon, tgs_sub_steps_per_snp=args.tgs_sub_steps_per_snp, tgs_r2_update_threshold=args.tgs_r2_update_threshold, tgs_selection_tolerance=args.tgs_selection_tolerance, tgs_window_sweeps=args.tgs_window_sweeps, **model_args)
+else:
+    model = EQTL_MIXTURE_PRIOR_GIBBS(**model_args)
 model.fit(data['G'], data['var_mean'], data['var_sd'], data['gene_var_ptr'], data['gene_var_idx'], data['Y'])
 
 # Sparse effect samples (one entry per variant-gene pair: a variant in several genes' windows appears once per gene)

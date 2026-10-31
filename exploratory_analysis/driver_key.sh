@@ -50,6 +50,10 @@ n_iters="10000"
 burn_in="5000"
 thin="5"
 fold_file=${cv_folds_dir}"gtex_individuals_"${n_folds}"_folds_seed_"${fold_seed}".txt"
+# Tempered Gibbs alternative (README.md, section 5b): same model and settings, results named ${tissue}_tempered_* so that both fits can be compared
+tempered_label="_tempered"
+# GWFM-style tempered Gibbs (README.md, section 5c): results named ${tissue}_tempered_gwfm_*
+gwfm_label="_tempered_gwfm"
 
 
 #####################
@@ -89,6 +93,28 @@ for held_out_fold in $(seq 1 ${n_folds}); do
 done
 fi
 
+#####################
+# 2b. Same as step 2 with the tempered Gibbs sampler (several times the time per iteration, plus about 10 GB of LD neighbour lists in memory).
+# Genes run in parallel, so give it cores, e.g. sbatch -c 8 -t 2-00:00 --mem=60G run_eqtl_mixture_prior_gibbs.sh ... tempered
+#####################
+if false; then
+mkdir -p ${gibbs_results_dir}
+for held_out_fold in $(seq 1 ${n_folds}); do
+	sbatch run_eqtl_mixture_prior_gibbs.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}${tempered_label}"_fold_"${held_out_fold} ${n_iters} ${burn_in} ${thin} tempered
+done
+fi
+
+#####################
+# 2c. Same as step 2 with the GWFM-style tempered Gibbs sampler (close to the standard sampler's time and memory)
+#####################
+if false; then
+mkdir -p ${gibbs_results_dir}
+for held_out_fold in $(seq 1 ${n_folds}); do
+	sbatch run_eqtl_mixture_prior_gibbs.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}${gwfm_label}"_fold_"${held_out_fold} ${n_iters} ${burn_in} ${thin} tempered_gwfm
+done
+fi
+
+
 
 
 
@@ -102,6 +128,26 @@ for held_out_fold in $(seq 1 ${n_folds}); do
 done
 fi
 
+#####################
+# 3b. Same as step 3 for the tempered fits of step 2b
+#####################
+if false; then
+mkdir -p ${held_out_evaluation_dir}
+for held_out_fold in $(seq 1 ${n_folds}); do
+	sbatch evaluate_held_out_expression_prediction.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}${tempered_label}"_fold_"${held_out_fold} ${held_out_evaluation_dir}${tissue}${tempered_label}"_fold_"${held_out_fold}"_held_out_evaluation.txt"
+done
+fi
+
+#####################
+# 3c. Same as step 3 for the GWFM-style fits of step 2c
+#####################
+if false; then
+mkdir -p ${held_out_evaluation_dir}
+for held_out_fold in $(seq 1 ${n_folds}); do
+	sbatch evaluate_held_out_expression_prediction.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}${gwfm_label}"_fold_"${held_out_fold} ${held_out_evaluation_dir}${tissue}${gwfm_label}"_fold_"${held_out_fold}"_held_out_evaluation.txt"
+done
+fi
+
 
 
 #####################
@@ -109,4 +155,18 @@ fi
 #####################
 if false; then
 sh organize_and_visualize_cross_validation_results.sh ${tissue} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir}
+fi
+
+#####################
+# 4b. Same as step 4 for the tempered fits (the file prefix ${tissue}_tempered selects them; pdfs are named ${tissue}_tempered_*)
+#####################
+if false; then
+sh organize_and_visualize_cross_validation_results.sh ${tissue}${tempered_label} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir}
+fi
+
+#####################
+# 4c. Same as step 4 for the GWFM-style fits (pdfs named ${tissue}_tempered_gwfm_*)
+#####################
+if false; then
+sh organize_and_visualize_cross_validation_results.sh ${tissue}${gwfm_label} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir}
 fi

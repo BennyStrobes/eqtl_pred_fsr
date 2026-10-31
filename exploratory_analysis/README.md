@@ -17,7 +17,7 @@ What changes relative to CoFine (`ca_qtls/fine_mapping/cofine.py`):
 
 - eQTLs only. No caQTL, peak-gene link or path structure.
 - Individual-level data instead of summary statistics plus LD. The likelihood is exact, and the held-out individuals get their own genotypes.
-- Standard random-scan Gibbs, not tempered Gibbs. This is prediction, not fine-mapping: when variants in high LD trade an effect between them, the prediction barely changes, so slow mixing between LD partners does not matter here.
+- Standard random-scan Gibbs by default. This is prediction, not fine-mapping: when variants in high LD trade an effect between them, the prediction barely changes, so slow mixing between LD partners should not matter much here. Two tempered Gibbs alternatives of the same model check this: a full tempered sampler (section 5b) and a GWFM-style sampler as in GCTB's genome-wide fine-mapping (section 5c). Their downstream analyses can be compared with the standard fit's. In simulations (section 5d) all three gave the same predictions and intervals, while the tempered samplers fixed standard Gibbs's over-confident PIPs among near-duplicate variants.
 
 ## 2. Data
 
@@ -107,6 +107,75 @@ then $r \leftarrow r - X_j(\beta_j^{new} - \beta_j^{old})$. Cost: $O(n_{tr})$ pe
 **Speed.** Given the hyper-parameters, genes are independent, so steps 1 and 2 can run in parallel over genes (numba `prange`; optional, one core is the default) and only step 3 synchronizes. The inner loops are numba-compiled, as in `cofine.py`. Genotypes are kept as `int8` alt-allele dosages of the training individuals (one row per variant passing the training filter, with per-gene index arrays) and standardized on the fly: $X_j^\top r = (G_j^\top r - m_j \sum_i r_i) / s_j$, with $G_j$ the raw dosages and $m_j$, $s_j$ the training mean and standard deviation. The residuals are recomputed from scratch every 100 iterations, to remove accumulated rounding error.
 
 **Defaults.** 3,000 iterations, 500 burn-in, keep every 5th: $S = 500$ retained samples. Initialization: $\beta = 0$, $\pi_0 = 0.99$, $(\sigma^2_1, \sigma^2_2) = (10^{-4}, 10^{-2})$, $\sigma^2_{e,g} = \operatorname{Var}(y_g)$. Initial slab weights: $(\pi_1, \pi_2) = (0.009, 0.001)$. PIPs, slab probabilities and posterior means average every post burn-in iteration, not only the retained ones.
+
+## 5b. Tempered Gibbs alternative
+
+`run_eqtl_mixture_prior_gibbs.py --tempered` (`run_eqtl_mixture_prior_gibbs.sh` with `tempered` as its 8th argument; steps 2b to 4b of `driver_key.sh`) fits the **same model** with a tempered Gibbs sampler (TGS; Zanella & Roberts 2019), as in the colocalization sampler `eb_coloc/multi_causal_variant/sims/ld/mcvc_tempered.py`. The outputs have the same format, so evaluation, organization and plots run unchanged. Results are named `${tissue}_tempered_*` so that both fits can be compared. Code: `eqtl_mixture_prior_tempered_gibbs.py`.
+
+**Class updates.** Per gene and sweep, $p_g$ sub-steps (`--tgs_sub_steps_per_snp`). Each variant has its full conditional $P_j(\cdot)$ (section 5, step 1) and a selection weight $p_j = g_j(z_j) / P_j(z_j)$, with $g_j = (1 - \epsilon) P_j + \epsilon / 3$ ($\epsilon$ = `--tgs_epsilon`, 0.5). A sub-step selects $j$ with probability $\propto p_j$, draws $z_j$ from $g_j$ and $\beta_j$ from its exact conditional given $z_j$, then updates the residual. A variant in an improbable class (for example, two LD partners both carrying one signal) is selected quickly. This lets an effect move between LD partners, which single-site Gibbs essentially never does once one partner holds a strong signal.
+
+**Weights.** The chain targets $\pi(x) Z(x)$ with $Z = \operatorname{mean}_j p_j$, so posterior expectations weight each visited sub-state by $1/Z$:
+
+- PIPs, slab probabilities and posterior means: $1/Z$-weighted Rao-Blackwellized averages over every post burn-in sub-state.
+- **Retained samples:** for each gene, one sub-state drawn with probability $\propto 1/Z$ among the sub-states since the previous retained iteration (`thin` sweeps). The saved effect samples are therefore approximately equally weighted posterior draws. The matching $\sigma^2_{e,g}$ sample is drawn from $\text{Inverse-Gamma}(a + n_{tr}/2, b + r^\top r/2)$ given that sub-state's residual.
+- **Hyper-parameters** ($\pi$, $\sigma^2_1$, $\sigma^2_2$, $\sigma^2_{e,g}$) are drawn from the same conditionals as in section 5, given importance-weighted *expected* class counts, sums of squares and residual sums of squares, pooled over the last 30 sweeps (`--tgs_window_sweeps`). This is an approximation, not an exact Gibbs step. The self-normalized weights bias a sweep's expected counts slightly upward, and the bias feeds back through $\pi$. In simulations (section 5d), pooling 1 sweep sent $\pi_1$ from 0.008 to 0.2, with $\sigma^2_1 \approx 5 \times 10^{-5}$ and PIP calibration errors of 0.2. Pooling 3 sweeps drifted slowly, 10 held $\pi_1$ but let $\sigma^2_1$ creep up, and 30 stayed close to the true values, with no drift over 10,000 iterations. The window costs only memory.
+
+**Individual-level data.** The conditional of a variant depends on the data only through its single-variant regression coefficient $b_a$. The sweep keeps $b_a$ for every variant. After a move of $j$ by $d$, it updates $b_a \leftarrow b_a - d R_{aj}$ for the variants in training-fold LD $r^2 \ge 0.01$ with $j$ (`--tgs_r2_update_threshold`; 0 is exact TGS), and refreshes all of them exactly at the start of the next sweep. The selected variant's $b_j$ is recomputed exactly from the residual unless it is known to be exact already. The residual is updated lazily, before the next exact recomputation. The sparse per-gene LD (int16 index and quantized $R$, 4 bytes per neighbour pair) is built once per fit, and its size is printed (Whole Blood: about 330 neighbours per variant, 10 GB).
+
+**Speed.** Each move changes the $b_a$ of a few hundred LD neighbours. A neighbour's conditional and selection weight are recomputed only once $b_a$ has moved enough that its selection weight may have changed by a relative `--tgs_selection_tolerance` (default $10^{-3}$; an exact bound, 0 recomputes every neighbour). The selected variant is drawn through per-block sums of the selection weights.
+
+**Checks.** On a small exact test (7 variants including a pair at $r = 0.99$, fixed hyper-parameters, all $3^7$ configurations enumerated), PIPs and posterior means averaged over 8 chains matched the exact posterior within 0.003 for tolerances 0, $10^{-3}$ and $10^{-2}$. Standard Gibbs was off by 0.017 on the LD pair, with twice the chain-to-chain spread.
+
+**Cost.** On simulated data resembling Whole Blood (640 variants per gene, 50% of them LD neighbours, $\sigma^2_1 = 10^{-4}$), one core takes about 4.5 times the standard sampler per iteration at the default tolerance and 3.8 times at $10^{-2}$. The first version took 7.6 times. Further cuts trade accuracy or mixing for speed: `--tgs_r2_update_threshold 0.05` (3.4 times), `--tgs_epsilon 0.25` (3.6 times), `--tgs_sub_steps_per_snp 0.5` (2.8 times). Genes run in parallel through numba `prange`: 4 cores ran 3.1 times faster than 1. Request cores for step 2b (for example `sbatch -c 8`).
+
+## 5c. GWFM-style tempered Gibbs alternative
+
+`run_eqtl_mixture_prior_gibbs.py --tempered --tgs_mode gwfm` (`run_eqtl_mixture_prior_gibbs.sh` with `tempered_gwfm` as its 8th argument; steps 2c to 4c of `driver_key.sh`, results `${tissue}_tempered_gwfm_*`) fits the same model as GCTB's genome-wide fine-mapping does (`--gwfm`, algorithm `TGS_thin` in `github.com/jianzeng/GCTB`, `scr/model.cpp`, `sampleFromTGS_eigen`). Code: `eqtl_mixture_prior_gwfm_tempered_gibbs.py`.
+
+- **Every iteration:** the standard Gibbs sweep of section 5. Effect samples, hyper-parameters and residual variances all come from this chain, as in the standard sampler.
+- **Every 10th iteration** (`--gwfm_interval`), tempered blocks on small sets. For each variant with running PIP $\ge 0.05$ (`--gwfm_pip_threshold`; mean over the previous iterations) that has an LD partner in the gene at training-fold $r^2 \ge 0.95$ (`--gwfm_r2_threshold`), the set is that variant plus its partners. A block is a fully tempered TGS, as in GCTB: a member is selected with probability $\propto 1/(3 P_a(z_a))$, its class is drawn uniformly from the two other classes, and its effect from its exact conditional. The members' $b_a$ are kept exact through their pairwise LD.
+- **End of a block:** the block ends in one of its sub-states, drawn with probability $\propto 1/Z$, after $\max(20, 10 |S|)$ sub-steps (`--gwfm_min_steps`, `--gwfm_steps_per_snp`). The $1/Z$-weighted slab probabilities and effects over the block replace the members' contributions of that iteration to the PIPs and posterior means, as GCTB replaces the members' PIPs.
+
+**Two departures from GCTB, both checked on the exact test of section 5b** (7 variants, an LD pair at $r^2 = 0.974$, fixed hyper-parameters, 16 chains):
+
+1. GCTB runs a block only when the focal variant's current class is non-zero. Whether the block runs then depends on the state the block resamples, which biases the chain. The pair's PIPs were off by 0.014 (10 standard errors), and by 0.029 with longer blocks. Here a block runs on the running PIP alone, and the error is 0.001 (within 1 standard error). Standard Gibbs had a chain-to-chain standard deviation 4 times larger on that pair.
+2. GCTB continues from the block's last sub-state, which is distributed as the tempered target, not the posterior. Applying GCTB's rule as written (block only when the focal class is non-zero, last sub-state, $|S|$ sub-steps) put the pair's PIPs off by 0.09 in this reimplementation. This is not GCTB itself: it has 3 classes, individual-level data and exact slab-to-slab updates.
+
+**Cost:** close to the standard sampler, about 3% more time on simulated data with 54% of variants in a near-duplicate pair.
+
+## 5d. Comparison of the three samplers in fine-mapping simulations
+
+**Design.** 400 genes × 500 variants per scenario. Haplotypes are mosaics of a few founders, with noise and shared branches, so that 53% of variants have a training-fold partner at $r^2 > 0.95$. Individuals: 560 in 4 folds, 420 for training. Causal variants have MAF $\ge 0.02$. Effects follow the fitted prior, $\pi = (0.9895, 0.0085, 0.002)$ and $\sigma^2 = (10^{-4}, 0.04)$, except where noted.
+
+Scenarios:
+
+- **A1, A2:** replicate datasets.
+- **B:** 75% of variants with a near-duplicate partner.
+- **C:** every large effect gets a second large effect on a variant in $r^2$ 0.3 to 0.9 with it.
+- **D:** misspecified, with 0.4% causal variants and Laplace effects.
+- **E:** the dataset of the first comparison with 10,000 iterations.
+
+A to D ran 3,000 iterations with 1,500 burn-in. Each sampler ran 2 chains, with all other settings at their defaults. Full TGS used the 30-sweep hyper-parameter window.
+
+**Reading the table.** PIP calibration error is the bin-size-weighted mean |predicted − observed| over PIP bins $\ge 0.1$. Each cell lists standard / full TGS / GWFM TGS.
+
+| scenario | PIP calibration error | same, variants with an $r^2 > 0.95$ partner | false PIP $\ge 0.95$ per chain | PIP $\ge 0.9$: expected : observed causal | between-chain PIP correlation, near-duplicates | held-out $r$, 90% interval coverage |
+|---|---|---|---|---|---|---|
+| A1 | 0.068 / 0.035 / 0.030 | 0.105 / 0.038 / 0.026 | 7.5 / 0 / 0.5 | 48:39 / 29:30 / 32:31 | 0.50 / 0.98 / 0.99 | 0.90 / 0.90 / 0.91 |
+| A2 | 0.052 / 0.020 / 0.027 | 0.092 / 0.033 / 0.041 | 8.0 / 1.0 / 0.5 | 61:54 / 42:42 / 43:43 | 0.39 / 0.98 / 0.97 | 0.88 / 0.87 / 0.88 |
+| B | 0.057 / 0.019 / 0.017 | 0.068 / 0.016 / 0.018 | 10.0 / 0 / 0 | 40:30 / 21:22 / 22:22 | 0.53 / 0.97 / 0.97 | 0.89 / 0.89 / 0.90 |
+| C | 0.052 / 0.023 / 0.016 | 0.064 / 0.024 / 0.022 | 14.0 / 1.5 / 1.5 | 80:66 / 55:52 / 56:54 | 0.50 / 0.97 / 0.97 | 0.87 / 0.88 / 0.87 |
+| D | 0.039 / 0.033 / 0.024 | 0.067 / 0.024 / 0.036 | 1.5 / 0 / 0 | 23:22 / 17:17 / 16:16 | 0.76 / 0.98 / 0.99 | 0.88 / 0.85 / 0.86 |
+| E (10k) | 0.013 / 0.019 / 0.008 | 0.028 / 0.028 / 0.022 | 0 / 0 / 0 | 55:55 / 52:53 / 52:53 | 0.66 / 0.99 / 0.99 | 0.89 / 0.89 / 0.88 |
+
+- **Fine-mapping.** At 3,000 iterations, standard Gibbs is over-confident. It puts a near-duplicate pair's signal on one member, and the member it picks differs between chains. Its PIP $\ge 0.95$ hits included 1.5 to 14 false positives per chain, and its PIP $\ge 0.9$ variants expected 5 to 33% more causal variants than were present. Both tempered samplers removed most of this and agreed between chains. GWFM matched full TGS everywhere.
+- **Longer chains:** with 10,000 iterations (E), standard Gibbs pooled over chains was calibrated, but its chains still disagreed on near-duplicates (correlation 0.66).
+- **Group level:** summing PIPs within a near-duplicate group gave similar calibration for all three samplers. Standard Gibbs gets a group's total right but puts it on the wrong member.
+- **Predictions** (held-out $r$, its intervals, `expression_FSR`) were the same for the three samplers in every scenario, as section 11, issue 5 expects.
+- **Hyper-parameters.** The standard and GWFM chains, whose hyper-parameter steps are exact, often emptied one slab: $\min(\pi_1, \pi_2) < 10^{-4}$ in part of the post-burn-in iterations of 8 of 12 standard chains and 7 of 12 GWFM chains. The emptied slab's variance then wandered (for example $\sigma^2_2 \approx 10^{2}$ to $10^{3}$ in E). Full TGS never did: its expected-statistics update (section 5b) keeps both slabs populated, and with the 30-sweep window it recovered $\pi_1 \approx 0.008$ to $0.01$ and $\sigma^2_1 \approx 1.2$ to $1.8 \times 10^{-4}$. That stability comes from the approximation, not from better mixing, so it does not show that the exact posterior of the hyper-parameters is that tight (section 11, issue 6).
+- **Speed** (one core, nothing else running, the A1-sized data): standard 0.046 s per iteration, full TGS 0.183 (4.0 times), GWFM 0.048 (1.03 times). On 4 cores: 0.014, 0.060 and 0.015.
+
+**Recommendation:** GWFM for fine-mapping at the standard sampler's cost. Full TGS when stable hyper-parameter estimates matter more than a fourfold cost.
 
 ## 6. What the sampler saves
 
@@ -211,7 +280,7 @@ Same layout as `ca_qtls/fine_mapping` and `gdl_uncertainty_paper`: `driver_key.s
 |---|---|---|
 | 0. Fold assignment | `generate_cross_validation_folds.py` / `.sh` | once (all GTEx individuals) |
 | 1. Prepare input | `prepare_gtex_tissue_data_for_gibbs.py` / `.sh`: per chromosome, expression of the tissue's individuals, `int8` alt-allele dosages for the union of cis variants (sorted by position, so each gene's variants are a contiguous range), and a summary file. Fold-agnostic. | tissue |
-| 2. Fit | `eqtl_mixture_prior_gibbs.py` (numba kernels and the `EQTL_MIXTURE_PRIOR_GIBBS` class, as `cofine.py`); `run_eqtl_mixture_prior_gibbs.py` / `.sh` (loads input, applies the fold, fits, writes section 6) | tissue × fold |
+| 2. Fit | `eqtl_mixture_prior_gibbs.py` (numba kernels and the `EQTL_MIXTURE_PRIOR_GIBBS` class, as `cofine.py`); `run_eqtl_mixture_prior_gibbs.py` / `.sh` (loads input, applies the fold, fits, writes section 6); with `--tempered`, `eqtl_mixture_prior_tempered_gibbs.py` (section 5b), or with `--tempered --tgs_mode gwfm`, `eqtl_mixture_prior_gwfm_tempered_gibbs.py` (section 5c) | tissue × fold (× sampler) |
 | (shared) | `posterior_beta_samples.py`: write and load the sparse effect samples, and compute $u^{(s)}$ for any genotype matrix | — |
 | 3. Evaluate | `evaluate_held_out_expression_prediction.py` / `.sh` (section 7): loads the effect samples and the fold's training and held-out dosages and expression from the step 1 input | tissue × fold |
 | 4. Organize and plot | `organize_and_visualize_cross_validation_results.sh`, calling `organize_cross_validation_results.py` and `visualize_cross_validation_results.R` (section 8) | tissue |
@@ -235,10 +304,10 @@ Output root: `/lab-share/CHIP-Strober-e2/Public/ben/eqtl_pred_fsr/`, with `cv_fo
 2. **Effect scale.** The prior is on standardized genotypes, as in gdl and S-LDMC, which implies larger per-allele effects for rarer variants. The alternative is a per-allele prior. The default is standardized.
 3. **Window.** $\pm 100$ kb (matches gdl, cheap) or $\pm 1$ Mb (GTEx cis window). Effects beyond 100 kb are missed, which lowers $r_{obs}$, but calibration should still hold because the expected quantities are for the same window.
 4. **Monte Carlo coupling.** $\hat y$ is the mean of the same $S$ samples it is compared with, which biases `genetic_FSR` down by $O(1/S)$. With $S = 500$ this is small. Check: compute $\hat y$ from the odd samples and the FSR from the even ones.
-5. **Mixing.** Random-scan Gibbs mixes slowly between variants in near-perfect LD. This should not affect predictions or the expected quantities, because those variants carry the same signal in held-out individuals of the same population. Check: two chains with different seeds, comparing $\hat y$ and `expression_FSR` per gene.
+5. **Mixing.** Random-scan Gibbs mixes slowly between variants in near-perfect LD. This should not affect predictions or the expected quantities, because those variants carry the same signal in held-out individuals of the same population. Check: two chains with different seeds, comparing $\hat y$ and `expression_FSR` per gene, or the tempered fit (section 5b).
 6. **Two-slab identifiability.** If one slab holds only a handful of variants, its variance is poorly determined under the near-flat prior and its draws are noisy. The ordering constraint stops label switching, but a slab with near-zero weight means a single slab would have been enough. The hyper-parameter plots (plot 6) show this.
 
-   This happened in the small simulation test (40k variant-gene pairs, with a small slab too weak to detect at $n \approx 420$). Under the near-flat Inverse-Gamma prior, the small slab's variance repeatedly collapsed toward $10^{-10}$, where it acts as a second spike. Once, the large slab emptied and kept an extreme variance ($\sim 36$) for a while before recovering. Predictions, FSRs and intervals stayed calibrated, so this mostly affects interpreting the hyper-parameters. Real data have about 250 times more pairs, so the slabs should be better identified. If the traces still wander, the remedy is a mildly informative Inverse-Gamma on the slab variances, or a floor on $\sigma^2_1$.
+   This happened in the small simulation test (40k variant-gene pairs, with a small slab too weak to detect at $n \approx 420$). Under the near-flat Inverse-Gamma prior, the small slab's variance repeatedly collapsed toward $10^{-10}$, where it acts as a second spike. Once, the large slab emptied and kept an extreme variance ($\sim 36$) for a while before recovering. Predictions, FSRs and intervals stayed calibrated, so this mostly affects interpreting the hyper-parameters. Real data have about 250 times more pairs, so the slabs should be better identified. If the traces still wander, the remedy is a mildly informative Inverse-Gamma on the slab variances, or a floor on $\sigma^2_1$. The fine-mapping simulations of section 5d (200k pairs per scenario) showed the same thing in the standard and GWFM chains: one slab emptied in part of 8 of 12 and 7 of 12 chains. The full tempered sampler's expected-statistics hyper-parameter update did not do this.
 7. **One fold or four.** The default is all four. A single fold is a quarter of the compute, but each calibration plot then rests on one split.
 
 ## 12. Validation plan
