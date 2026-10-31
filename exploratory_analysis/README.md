@@ -177,6 +177,68 @@ A to D ran 3,000 iterations with 1,500 burn-in. Each sampler ran 2 chains, with 
 
 **Recommendation:** GWFM for fine-mapping at the standard sampler's cost. Full TGS when stable hyper-parameter estimates matter more than a fourfold cost.
 
+## 5e. Fixed-grid mixture prior (alternative model)
+
+`run_eqtl_grid_prior_gibbs.py` (`run_eqtl_grid_prior_gibbs.sh`; code `eqtl_grid_prior_gibbs.py`, and with `--gwfm` / `gwfm` as the 8th argument `eqtl_grid_prior_gwfm_tempered_gibbs.py`) fits a second model to the same data (steps 2d to 4e of `driver_key.sh`; results `${tissue}_grid_*` and `${tissue}_grid_gwfm_*`). The existing model's code is untouched.
+
+**Model.** As section 4, but the effect prior has fixed component variances, as in BayesR (Erbe et al. 2012) and close to ash / mr.ash:
+
+$$
+\beta_{gj} \sim \pi_0\, \delta_0 + \sum_{k=1}^{K} \pi_k\, N(0, \sigma^2_k), \qquad \pi \sim \text{Dirichlet}(\alpha, \ldots, \alpha).
+$$
+
+- **Grid** (`--grid_variances`): half-decades from $10^{-4}$ to 1, so $K = 9$.
+- **Dirichlet** $\alpha$ = 0.1 (`--dirichlet_alpha`).
+
+Only $\pi$ is learned, so no variance can collapse and labels cannot switch.
+
+**Samplers:**
+- **Standard Gibbs:** section 5 with $K + 1$ classes. The per-variant cost is the same $O(n_{tr})$ dot product plus $K + 1$ exponentials.
+- **GWFM:** section 5c with $K + 1$ classes, as GCTB does for its classes. A member is selected with probability $\propto 1/((K+1) P_a(z_a))$, and its new class is drawn uniformly from the $K$ others.
+- **$\pi$ draws** are in log space and floored only at the smallest positive double. The two-slab model's floor of $1/n_{pairs}$ held the empty large-variance components (0.32 and 1) far above their posterior weight. In a 164k-pair simulation that inflated the prior's per-variant variance $E[\beta^2]$ by 25%.
+
+**Outputs.** The same files as section 6, so evaluation, organization and plots run unchanged:
+- **PIP:** the probability of any non-zero component.
+- **"Slab 1" / "slab 2"** (`pair_p_slab1/2`, `expected_n_slab1/2`): the small group (variance $<$ `--small_large_cutoff`, $10^{-3}$) and the large group.
+- **Hyper-parameters:** pi0, pi1, pi2, sigma2_1 and sigma2_2 are the collapsed two-group mixture. pi1 is the small group's total weight and sigma2_1 its weight-averaged variance, and likewise for the large group. The prior-implied cis-$h^2$ of plot 6 is therefore exact.
+- **Additional files:** `grid_weight_trace.txt` and `grid_weight_summary.txt` (per component: variance, group, posterior mean and 95% interval).
+
+**Checks.** The exact test of section 5b, with a spike and 3 components, enumerated all $4^7$ configurations. Both kernels matched the exact PIPs, group probabilities and posterior means. Grid GWFM was within 2 SE everywhere. Grid standard Gibbs mixed slowly on the $r = 0.987$ pair: single chains were off by up to 0.036, as with the two-slab model, and its chain-to-chain spread was 3.8 times GWFM's.
+
+**Simulations** (section 5d design, 2 chains each):
+- **G1:** effects drawn from a grid prior. $\pi$ = 0.006, 0.003, 0.0015 and 0.0005 on variances $10^{-4}$, $10^{-3}$, $10^{-2}$ and $10^{-1}$.
+- **A1:** the two-slab truth, whose large variance (0.04) is off the grid.
+- **D:** Laplace effects.
+
+PIP calibration error (bins $\ge 0.1$), standard / GWFM:
+
+| scenario | two-slab model | grid model |
+|---|---|---|
+| G1 | 0.086 / 0.045 | 0.075 / 0.038 |
+| A1 | 0.068 / 0.030 | 0.067 / 0.041 |
+| D | 0.039 / 0.024 | 0.043 / 0.027 |
+
+- **PIPs.** Grid GWFM had no false PIP $\ge 0.95$ hits, and its chains agreed on near-duplicates (correlation 0.95 to 0.97). Grid standard Gibbs was over-confident, as standard Gibbs is under the two-slab prior. Predictions and their intervals were the same for all four samplers.
+- **Prior recovery at $n_{tr} = 420$.** Fitted against realized $P(|\beta| > t)$ among the analysed pairs:
+  - In G1 and A1 (off-grid truth), the grid model was within about 25% for $0.02 \le t \le 0.4$.
+  - In D (Laplace), it was within 16% for $0.05 \le t \le 0.2$. At $t = 0.02$ grid Gibbs was 2 times too high (two-slab GWFM: 2.7 times). At $t = 0.4$, which covers about a dozen pairs, both grid samplers were 1.5 times too high (two-slab GWFM: 1.7 times).
+  - Its $E[\beta^2]$ was within 1 to 14% everywhere.
+- **What is not identified at $n_{tr} = 420$:** effects below about 0.01 (variance $\lesssim 10^{-4}$, under 1/20 of a variant's sampling variance) and the weights of individual half-decade components. Chains put the small-effect mass anywhere from 0.3 to 4 times the truth, and neighbouring components trade weight between chains. The two-slab model has the same limitation (section 11, issue 6).
+- **Starting the grid at $10^{-5}$** ("grid from 1e-5", 11 components) left PIP calibration and the tails above 0.02 unchanged. It moved more of the unidentified small-effect mass into the near-spike components.
+
+**Prior recovery with more data.** G1's prior was simulated again with 2,000 individuals ($n_{tr} = 1{,}500$):
+- **Identified components:** both grid samplers recovered the weights of the $10^{-2}$ and $10^{-1}$ components (truth $1.40 \times 10^{-3}$ and $5.4 \times 10^{-4}$; the four chains gave $1.4$ to $1.7 \times 10^{-3}$ and $4.5$ to $5.1 \times 10^{-4}$), and left the empty neighbours (0.032, 0.32, 1) near zero.
+- **Tails and variance:** $P(|\beta| > t)$ was within 6% for $t \ge 0.05$, and $E[\beta^2]$ within 5%.
+- **Small end:** variances $10^{-4}$ to $10^{-3}$, whose effects have $z \approx 1$, were still placed differently by different chains.
+- **Two-slab model on the same data:** right for the large tail, but $P(|\beta| > 0.01)$ was about half the truth. Two slabs cannot represent the four components.
+
+The sampler therefore recovers what the data identify, and the remaining disagreement is identifiability, not a sampler error.
+- **PIP calibration error (bins $\ge 0.1$):** grid GWFM 0.031, two-slab GWFM 0.026. Grid standard Gibbs (0.055) was over-confident, as standard Gibbs is.
+
+**Cost** (same batch, so comparable): the grid samplers took 14% longer than the two-slab samplers at $n_{tr} = 420$, and 5% longer at $n_{tr} = 1{,}500$, where the dot products dominate the $K + 1$ exponentials.
+
+**Recommendation:** grid GWFM, for the reasons section 5d gives for GWFM. Read the grid weights for components with variance below about $10^{-3}$ (at GTEx sample sizes) as not identified, and summarize the prior through its tails or $E[\beta^2]$ rather than individual weights.
+
 ## 6. What the sampler saves
 
 **The $S = 500$ retained samples of every causal effect $\beta_{gj}^{(s)}$**, so the fitted posterior can be applied to any other genotype data (another cohort, another tissue's individuals, simulated genotypes) without refitting.
@@ -267,8 +329,13 @@ One set per tissue, with folds as replicates (separate panels, or pooled with fo
 1. **Correlation calibration.** 10 equal-count bins of `expected_r`: mean `observed_r` with a 95% CI against mean `expected_r`, with the line $y = x$. Repeated with `expected_r_plugin`.
 2. **Genetic-scale calibration.** As gdl Plot 2: bins of `expected_genetic_r` against bin mean $r_{obs}$ / $\sqrt{\text{bin mean } \hat h^2_{test}}$.
 3. **FSR calibration.** Bins of `expression_FSR` (0 to 0.1, 0.1 to 0.2, 0.2 to 0.3, 0.3 to 0.4, above 0.4, as in gdl): the fraction of genes with $r_{obs} < 0$ (binomial CI) against mean `expression_FSR`. Repeated with `genetic_FSR` for comparison with gdl.
+   - (b) `expression_FSR` and `genetic_FSR`, each alone in 10 equal-count bins, on its own scale (`_expression_fsr_calibration_deciles`, `_genetic_fsr_calibration_deciles`).
+   - (c) Genes called at FSR $\le$ 0.001, 0.01, 0.05, 0.1, 0.2 and 0.3: the fraction with $r_{obs} < 0$ (with the number of genes called), the mean FSR of the called genes (expected) and the threshold, for both FSRs (`_fsr_threshold_calibration`).
+   - (d) (c) for `expression_FSR`, pooled folds only, with a legend (`_expression_fsr_threshold_calibration_pooled`).
 4. **Coverage.** Nominal level (80, 90, 95, 99%) against the fraction of genes whose $r_{obs}$ falls inside its posterior predictive interval.
 5. **Top-N genes.** Mean $r_{obs}$ of the top $N$ genes ranked by `expected_r`, $1 -$ `expression_FSR`, `expected_r` $-$ 1 SD, `expected_cis_h2`, `max_pip`, `sum_pip` and, as model-free baselines, `cis_snp_h2_he_train` and $-\log_{10}$ `cis_snp_h2_pvalue_train`.
+   - (b) The same rankings, with the fraction of the top $N$ genes with $r_{obs} < 0$ in place of the mean $r_{obs}$, plus the mean `expression_FSR` of the top $N$ under the FSR ranking (the expected value; `_top_n_genes_observed_fsr`).
+   - (c) (b) for the expression-FSR ranking only, observed and expected with a legend: pooled folds on a log $N$ axis (`_top_n_genes_observed_fsr_expression_fsr_pooled`), and fold 1 alone on a linear $N$ axis (`_top_n_genes_observed_fsr_expression_fsr_fold_1_linear`).
 6. **Hyper-parameters.** Traces (convergence), and posterior mean with 95% interval per fold. The implied prior on per-gene cis-$h^2$ and on the number of causal variants per gene, split by slab.
 7. **Heritability.** (a) Calibration: 10 equal-count bins of `expected_cis_h2`, with bin mean `cis_snp_h2_he_test` against bin mean `expected_cis_h2`. (b) Training against held-out: `posterior_cis_h2_train` and `cis_snp_h2_he_train` against `cis_snp_h2_he_test`, binned. This shows how much the in-sample estimates overstate held-out heritability.
 
@@ -281,6 +348,7 @@ Same layout as `ca_qtls/fine_mapping` and `gdl_uncertainty_paper`: `driver_key.s
 | 0. Fold assignment | `generate_cross_validation_folds.py` / `.sh` | once (all GTEx individuals) |
 | 1. Prepare input | `prepare_gtex_tissue_data_for_gibbs.py` / `.sh`: per chromosome, expression of the tissue's individuals, `int8` alt-allele dosages for the union of cis variants (sorted by position, so each gene's variants are a contiguous range), and a summary file. Fold-agnostic. | tissue |
 | 2. Fit | `eqtl_mixture_prior_gibbs.py` (numba kernels and the `EQTL_MIXTURE_PRIOR_GIBBS` class, as `cofine.py`); `run_eqtl_mixture_prior_gibbs.py` / `.sh` (loads input, applies the fold, fits, writes section 6); with `--tempered`, `eqtl_mixture_prior_tempered_gibbs.py` (section 5b), or with `--tempered --tgs_mode gwfm`, `eqtl_mixture_prior_gwfm_tempered_gibbs.py` (section 5c) | tissue × fold (× sampler) |
+| 2'. Fit, fixed-grid prior | `eqtl_grid_prior_gibbs.py`, `eqtl_grid_prior_gwfm_tempered_gibbs.py`, `run_eqtl_grid_prior_gibbs.py` / `.sh` (section 5e); outputs as step 2, plus the grid weights | tissue × fold (× sampler) |
 | (shared) | `posterior_beta_samples.py`: write and load the sparse effect samples, and compute $u^{(s)}$ for any genotype matrix | — |
 | 3. Evaluate | `evaluate_held_out_expression_prediction.py` / `.sh` (section 7): loads the effect samples and the fold's training and held-out dosages and expression from the step 1 input | tissue × fold |
 | 4. Organize and plot | `organize_and_visualize_cross_validation_results.sh`, calling `organize_cross_validation_results.py` and `visualize_cross_validation_results.R` (section 8) | tissue |

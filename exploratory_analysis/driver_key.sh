@@ -54,6 +54,10 @@ fold_file=${cv_folds_dir}"gtex_individuals_"${n_folds}"_folds_seed_"${fold_seed}
 tempered_label="_tempered"
 # GWFM-style tempered Gibbs (README.md, section 5c): results named ${tissue}_tempered_gwfm_*
 gwfm_label="_tempered_gwfm"
+# Fixed-grid mixture prior (README.md, section 5e): a different prior on the same data, results named ${tissue}_grid_* (standard Gibbs) and
+# ${tissue}_grid_gwfm_* (GWFM-style tempered Gibbs)
+grid_label="_grid"
+grid_gwfm_label="_grid_gwfm"
 
 
 #####################
@@ -114,6 +118,29 @@ for held_out_fold in $(seq 1 ${n_folds}); do
 done
 fi
 
+#####################
+# 2d. Fit the fixed-grid mixture prior with standard Gibbs (about 10% more time than step 2)
+#####################
+if false; then
+mkdir -p ${gibbs_results_dir}
+for held_out_fold in $(seq 1 ${n_folds}); do
+	sbatch run_eqtl_grid_prior_gibbs.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}${grid_label}"_fold_"${held_out_fold} ${n_iters} ${burn_in} ${thin}
+done
+fi
+
+
+
+#####################
+# 2e. Fit the fixed-grid mixture prior with the GWFM-style tempered Gibbs sampler
+#####################
+if false; then
+mkdir -p ${gibbs_results_dir}
+for held_out_fold in $(seq 1 ${n_folds}); do
+	sbatch run_eqtl_grid_prior_gibbs.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}${grid_gwfm_label}"_fold_"${held_out_fold} ${n_iters} ${burn_in} ${thin} gwfm
+done
+fi
+
+
 
 
 
@@ -127,6 +154,7 @@ for held_out_fold in $(seq 1 ${n_folds}); do
 	sbatch evaluate_held_out_expression_prediction.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}"_fold_"${held_out_fold} ${held_out_evaluation_dir}${tissue}"_fold_"${held_out_fold}"_held_out_evaluation.txt"
 done
 fi
+
 
 #####################
 # 3b. Same as step 3 for the tempered fits of step 2b
@@ -148,6 +176,26 @@ for held_out_fold in $(seq 1 ${n_folds}); do
 done
 fi
 
+#####################
+# 3d. Same as step 3 for the fixed-grid fits of step 2d
+#####################
+if false; then
+mkdir -p ${held_out_evaluation_dir}
+for held_out_fold in $(seq 1 ${n_folds}); do
+	sbatch evaluate_held_out_expression_prediction.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}${grid_label}"_fold_"${held_out_fold} ${held_out_evaluation_dir}${tissue}${grid_label}"_fold_"${held_out_fold}"_held_out_evaluation.txt"
+done
+fi
+
+#####################
+# 3e. Same as step 3 for the fixed-grid GWFM-style fits of step 2e
+#####################
+if false; then
+mkdir -p ${held_out_evaluation_dir}
+for held_out_fold in $(seq 1 ${n_folds}); do
+	sbatch evaluate_held_out_expression_prediction.sh ${gibbs_input_summary_file} ${fold_file} ${held_out_fold} ${gibbs_results_dir}${tissue}${grid_gwfm_label}"_fold_"${held_out_fold} ${held_out_evaluation_dir}${tissue}${grid_gwfm_label}"_fold_"${held_out_fold}"_held_out_evaluation.txt"
+done
+fi
+
 
 
 #####################
@@ -156,6 +204,7 @@ fi
 if false; then
 sh organize_and_visualize_cross_validation_results.sh ${tissue} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir}
 fi
+
 
 #####################
 # 4b. Same as step 4 for the tempered fits (the file prefix ${tissue}_tempered selects them; pdfs are named ${tissue}_tempered_*)
@@ -169,4 +218,19 @@ fi
 #####################
 if false; then
 sh organize_and_visualize_cross_validation_results.sh ${tissue}${gwfm_label} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir}
+fi
+
+#####################
+# 4d. Same as step 4 for the fixed-grid fits (pdfs named ${tissue}_grid_*; the hyper-parameter plot shows the collapsed small / large groups,
+# the per-component weights are in ${gibbs_results_dir}${tissue}_grid_fold_*_grid_weight_summary.txt)
+#####################
+if false; then
+sh organize_and_visualize_cross_validation_results.sh ${tissue}${grid_label} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir}
+fi
+
+#####################
+# 4e. Same as step 4 for the fixed-grid GWFM-style fits (pdfs named ${tissue}_grid_gwfm_*)
+#####################
+if false; then
+sh organize_and_visualize_cross_validation_results.sh ${tissue}${grid_gwfm_label} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir}
 fi
