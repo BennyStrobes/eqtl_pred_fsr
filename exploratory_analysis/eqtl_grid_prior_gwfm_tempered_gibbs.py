@@ -2,7 +2,7 @@ import numpy as np
 import time
 from numba import njit, prange
 from eqtl_grid_prior_gibbs import EQTL_GRID_PRIOR_GIBBS, _grid_gibbs_sweep_numba
-from eqtl_mixture_prior_tempered_gibbs import build_sparse_ld_neighbours
+from eqtl_mixture_prior_gwfm_tempered_gibbs import build_sparse_ld_neighbours
 
 
 ###############################################################################
@@ -234,6 +234,6 @@ class EQTL_GRID_PRIOR_GWFM_TEMPERED_GIBBS(EQTL_GRID_PRIOR_GIBBS):
         self.it_beta = np.zeros(self.n_pairs)
         self.stats = np.zeros((self.n_genes, 2))
         t0 = time.time()
-        self.fr_ptr, self.fr_idx, _ = build_sparse_ld_neighbours(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, self.gwfm_r2_threshold)
+        self.fr_ptr, self.fr_idx = build_sparse_ld_neighbours(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, self.gwfm_r2_threshold)
         set_sizes = np.diff(self.fr_ptr)
         print('GWFM tempered Gibbs: interval=' + str(self.gwfm_interval) + ' r2_threshold=' + str(self.gwfm_r2_threshold) + ' pip_threshold=' + str(self.gwfm_pip_threshold) + ' steps_per_snp=' + str(self.gwfm_steps_per_snp) + ' min_steps=' + str(self.gwfm_min_steps) + '; %.1f%% of variants have an LD partner, mean set size %.1f among them (built in %.0f sec)' % (100.0 * np.mean(set_sizes > 1), np.mean(set_sizes[set_sizes > 1]) if np.any(set_sizes > 1) else 0.0, time.time() - t0), flush=True)

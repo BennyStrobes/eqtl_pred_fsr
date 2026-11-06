@@ -78,6 +78,20 @@ Neither guard changes anything while every slab holds variants. If either one fi
 
 ## 5. Gibbs sampler
 
+**The six models.** `driver_key.sh` runs steps 0 to 4 on three priors, each with two samplers. Every fit gets the split-sample evaluation (step 3) and the plots (step 4).
+
+| Prior | Standard Gibbs | GWFM-style tempered Gibbs (section 5c) |
+|---|---|---|
+| Spike and two slab | `_spike_slab_gibbs` | `_spike_slab_gwfm` |
+| Fixed grid, one prior shared by all genes (section 5e) | `_grid_gibbs` | `_grid_gwfm` |
+| Fixed grid with 5 latent gene classes (section 5j, which tested 10) | `_grid_classes_gibbs` | `_grid_classes_gwfm` |
+
+The labels follow the tissue in every output name. Both gene-class fits make the non-centred class move every iteration, so those two differ only in the GWFM blocks, and they get the class plots of step 4b.
+
+**Check of GWFM with gene classes.** The simulations of section 5j used standard Gibbs, so the combination was compared with an exact posterior: 2 genes with 4 variants each (a near-duplicate pair in each, $r^2 \ge 0.95$), a spike and 2 grid components, 3 classes, fixed residual variances, $3^8 = 6561$ configurations enumerated, with the weights and classes integrated out. Over 32 chains of 300,000 iterations, the running PIPs and group probabilities and the sample PIPs, means, second moments and $P(c_1 = c_2)$ all matched (largest error 0.0009, rms z about 1). Grid GWFM without classes, also 32 chains, was close but not clean: errors of at most 0.0005 in group probabilities and 0.0002 in second moments, with z up to 4 in one gene. This may be a small real bias (the block's end state is only approximately a posterior draw; see the top of `eqtl_mixture_prior_gwfm_tempered_gibbs.py`), but it is too small to matter here. Fits are not reproducible at a fixed `--seed`, even on one thread.
+
+**Note on removed code.** Sections 5b to 5d and 5f to 5k stay as the record of what was tried and found. Driver step numbers and result names in those sections are the ones used at the time. The full tempered sampler, the prior and gene-pair checks, `check_expression_fsr_excess.py`, `simulate_gibbs_input.py`, `compare_sampler_fits.py` and the simulation scripts were removed after commit `0b35e4a`, where they can be recovered.
+
 Latent class $z_{gj} \in \{0, 1, 2\}$ per variant ($0$ = spike). One iteration:
 
 **1. Effects, every gene** (random-scan over variants within each gene). Keep the residual $r = y_g - X_g \beta_g$. For variant $j$, with $X_j^\top X_j = n_{tr}$:
@@ -130,7 +144,7 @@ then $r \leftarrow r - X_j(\beta_j^{new} - \beta_j^{old})$. Cost: $O(n_{tr})$ pe
 
 ## 5c. GWFM-style tempered Gibbs alternative
 
-`run_eqtl_mixture_prior_gibbs.py --tempered --tgs_mode gwfm` (`run_eqtl_mixture_prior_gibbs.sh` with `tempered_gwfm` as its 8th argument; steps 2c to 4c of `driver_key.sh`, results `${tissue}_tempered_gwfm_*`) fits the same model as GCTB's genome-wide fine-mapping does (`--gwfm`, algorithm `TGS_thin` in `github.com/jianzeng/GCTB`, `scr/model.cpp`, `sampleFromTGS_eigen`). Code: `eqtl_mixture_prior_gwfm_tempered_gibbs.py`.
+`run_eqtl_mixture_prior_gibbs.py --gwfm` (`run_eqtl_mixture_prior_gibbs.sh` with `gwfm` as its 8th argument; results `${tissue}_spike_slab_gwfm_*`) fits the same model as GCTB's genome-wide fine-mapping does (`--gwfm`, algorithm `TGS_thin` in `github.com/jianzeng/GCTB`, `scr/model.cpp`, `sampleFromTGS_eigen`). Code: `eqtl_mixture_prior_gwfm_tempered_gibbs.py`.
 
 - **Every iteration:** the standard Gibbs sweep of section 5. Effect samples, hyper-parameters and residual variances all come from this chain, as in the standard sampler.
 - **Every 10th iteration** (`--gwfm_interval`), tempered blocks on small sets. For each variant with running PIP $\ge 0.05$ (`--gwfm_pip_threshold`; mean over the previous iterations) that has an LD partner in the gene at training-fold $r^2 \ge 0.95$ (`--gwfm_r2_threshold`), the set is that variant plus its partners. A block is a fully tempered TGS, as in GCTB: a member is selected with probability $\propto 1/(3 P_a(z_a))$, its class is drawn uniformly from the two other classes, and its effect from its exact conditional. The members' $b_a$ are kept exact through their pairwise LD.
@@ -179,7 +193,7 @@ A to D ran 3,000 iterations with 1,500 burn-in. Each sampler ran 2 chains, with 
 
 ## 5e. Fixed-grid mixture prior (alternative model)
 
-`run_eqtl_grid_prior_gibbs.py` (`run_eqtl_grid_prior_gibbs.sh`; code `eqtl_grid_prior_gibbs.py`, and with `--gwfm` / `gwfm` as the 8th argument `eqtl_grid_prior_gwfm_tempered_gibbs.py`) fits a second model to the same data (steps 2d to 4e of `driver_key.sh`; results `${tissue}_grid_*` and `${tissue}_grid_gwfm_*`). The existing model's code is untouched.
+`run_eqtl_grid_prior_gibbs.py` (`run_eqtl_grid_prior_gibbs.sh`; code `eqtl_grid_prior_gibbs.py`, and with `--gwfm` / `gwfm` as the 8th argument `eqtl_grid_prior_gwfm_tempered_gibbs.py`) fits a second model to the same data (step 2 of `driver_key.sh`; results `${tissue}_grid_gibbs_*` and `${tissue}_grid_gwfm_*`). The existing model's code is untouched.
 
 **Model.** As section 4, but the effect prior has fixed component variances, as in BayesR (Erbe et al. 2012) and close to ash / mr.ash:
 
@@ -353,7 +367,7 @@ Simulations with the model exactly right (`simulate_gibbs_input.py`, and an in-m
 7. **PIPs:** $P(|\beta| > 0.1)$ was calibrated in every fit (for example 922 expected against 915 causal pairs with probability $\ge 0.5$). PIP $= P(\beta \ne 0)$ was calibrated above 0.5 (970 against 958; the top bin slightly optimistic, 0.90 to 0.93 observed at a mean of 0.956), but summed PIPs were 1.2 to 4 times the number of causal pairs: inclusion of near-null effects is not identified.
 8. **cis-h2:** the posterior `posterior_cis_h2_train` had a correlation of 0.98 with the truth, slope 1.00 to 1.04, and 95% coverage 0.92 to 0.96. The exception was the shared prior with null genes (coverage 0.63 to 0.72), which gives genes with no eQTL about 0.013. ML and HE were about unbiased for $\operatorname{Var}(u) / \operatorname{Var}(y)$, with correlations of 0.88 to 0.93.
 
-**Recommended setup** (driver step 13): `gene_classes_10`, the GWFM sampler, 1,000 or more retained samples, and the split-sample evaluation. The class moves (about one sweep's cost per iteration) and the hierarchical residual-variance prior are optional. They did not change calibration, but they cost little, and the class moves guard against the plain-Gibbs failure in item 5.
+**Recommended setup** (`_grid_classes_gibbs`, driver steps 2, 3 and 4: the sampler changes PIPs, not predictions): `gene_classes_10`, 1,000 or more retained samples, and the split-sample evaluation. The class moves (about one sweep's cost per iteration) and the hierarchical residual-variance prior are optional. They did not change calibration, but they cost little, and the class moves guard against the plain-Gibbs failure in item 5.
 
 ## 6. What the sampler saves
 
@@ -411,7 +425,7 @@ These are estimated from genotypes and expression alone, without the fitted mode
 | `expected_cis_snp_h2_he_var_test` | What the model predicts `cis_snp_h2_he_var_test` to be: $\frac{1}{S} \sum_s u^{(s)\top} W u^{(s)}$ with $W$ the HE weights of the held-out GRM, the exact expected HE slope given $u^{(s)}$ under iid noise. HE weights an effect by the LD of its variant relative to the window (in the population, the slope is $m\, \beta^\top R^2 \beta / \operatorname{tr}(R^2)$), so it need not equal $\operatorname{Var}(u)$ |
 | `cis_snp_h2_{train,test}` | Maximum-likelihood $h^2$ of the single-component model $y \sim N(0, \sigma^2[h^2 K + (1 - h^2) I])$, with $K$ the cis GRM, bounded to $[0, 1]$ (gdl `estimate_cis_snp_heritability_with_lrt`) |
 | `cis_snp_h2_pvalue_{train,test}` | Likelihood-ratio test of $h^2 = 0$, with a 50:50 mixture of $\chi^2_0$ and $\chi^2_1$ because $h^2 = 0$ is on the boundary (same function) |
-| `cis_snp_h2_he_{train,test}` | Haseman-Elston $h^2$: unbiased and can be negative, so it can be averaged over low-$h^2$ genes (gdl `estimate_cis_snp_heritability_with_he_regression`) |
+| `cis_snp_h2_he_{train,test}` | Haseman-Elston $h^2$. It can be negative, so it can be averaged over low-$h^2$ genes. It is unbiased only when effects are unrelated to LD: an eQTL in higher LD than its window is over-counted (see `expected_cis_snp_h2_he_var_test`). In Whole Blood the model's effects predict held-out HE closely, with HE above $\operatorname{Var}(X\beta)$ (top bin 0.46 against 0.36) (gdl `estimate_cis_snp_heritability_with_he_regression`) |
 | `var_y_{train,test}`, `cis_snp_h2_he_var_{train,test}` | Variance of the expression in those individuals, and `cis_snp_h2_he` times it: the HE estimate of $\operatorname{Var}(u)$. `cis_snp_h2_he` is a proportion of `var_y`, while `expected_cis_h2` and `posterior_cis_h2_train` are variances, so these are the columns to compare with them |
 | `cis_snp_h2_he_se_{train,test}` | Its analytic standard error at the fitted $h^2$ (same function) |
 | `cis_snp_h2_he_pvalue_{train,test}` | One-sided test of $h^2 = 0$: $1 - \Phi(\hat h^2_{HE} / \text{SE}_0)$, with $\text{SE}_0$ the same analytic standard error evaluated at $h^2 = 0$ (the null distribution, rather than the fitted $h^2$) |
@@ -464,10 +478,10 @@ One set per tissue, with folds as replicates (separate panels, or pooled with fo
    - (e) `_heritability_calibration_predicted_he`: `cis_snp_h2_he_var_test` against `expected_cis_snp_h2_he_var_test`, and `expected_cis_snp_h2_he_var_test` against `expected_cis_h2`.
 8. **Genetic FSR distribution, fold 1.** Histograms of `genetic_FSR` (bins of 0.01) for (a) all genes and (b) heritable genes (training LRT $p < 0.05$), stacked on the same x axis (`_genetic_fsr_histogram_fold_1`).
 
-9. **Latent gene classes** (fits with `--n_gene_classes`; `visualize_gene_classes.sh`, driver step 14c). Class labels mean nothing between folds, and a class with no genes has weights drawn from the prior, so classes are summarized only over samples in which they hold genes, classes with fewer than 10 genes on average are not ranked, and the rest are ranked within each fold by the weight of the large group (variance $\ge 10^{-3}$, the identified part of the prior). The gene-level quantities (`class_large_weight`, `prior_expected_h2`, and so on) average the weights of the class a gene is in at each sample, so they do not depend on the labels. All come from the training individuals, so genes can be stratified on them.
+9. **Latent gene classes** (fits with `--n_gene_classes`; `visualize_gene_classes.sh`, driver step 4b). Class labels mean nothing between folds, and a class with no genes has weights drawn from the prior, so classes are summarized only over samples in which they hold genes, classes with fewer than 10 genes on average are not ranked, and the rest are ranked within each fold by the weight of the large group (variance $\ge 10^{-3}$, the identified part of the prior). The gene-level quantities (`class_large_weight`, `prior_expected_h2`, and so on) average the weights of the class a gene is in at each sample, so they do not depend on the labels. All come from the training individuals, so genes can be stratified on them.
    - (a) `_gene_classes_profile`: per fold and class, the share of genes, inclusion probability and large-group weight (values below $10^{-6}$ shown at $10^{-6}$).
    - (b) `_gene_classes_effect_sizes`: the weight of each grid component among each class's non-zero effects. Only read it for the large components; the small ones are not identified (section 5e).
-   - (c) `_gene_classes_traces`: class weights and inclusion probabilities. Two classes crossing would be a label switch, which the ranking assumes does not happen.
+   - (c) `_gene_classes_traces`: class weights and inclusion probabilities. Small classes can empty and fill again with different content, and classes can cross. The rank of such a class means little, so ignore the class-level summaries of classes under about 1% of genes. The gene-level quantities are not affected.
    - (d) `_gene_classes_per_gene`: assignment certainty, the prior number of large-group effects per gene, the class rate against the number of cis variants, and the class-implied prior $h^2$ against held-out HE.
    - (e) `_gene_classes_expression_fsr_calibration`: plot 3e within terciles of `class_large_weight`.
    - (f) `_gene_classes_expression_fsr_excess` (and `.txt`): the mid-range expression FSR excess by tercile of `n_cis_variants`, tercile of `class_large_weight` and training LRT $p$ above or below 0.05.
@@ -481,18 +495,12 @@ Same layout as `ca_qtls/fine_mapping` and `gdl_uncertainty_paper`: `driver_key.s
 |---|---|---|
 | 0. Fold assignment | `generate_cross_validation_folds.py` / `.sh` | once (all GTEx individuals) |
 | 1. Prepare input | `prepare_gtex_tissue_data_for_gibbs.py` / `.sh`: per chromosome, expression of the tissue's individuals, `int8` alt-allele dosages for the union of cis variants (sorted by position, so each gene's variants are a contiguous range), and a summary file. Fold-agnostic. | tissue |
-| 2. Fit | `eqtl_mixture_prior_gibbs.py` (numba kernels and the `EQTL_MIXTURE_PRIOR_GIBBS` class, as `cofine.py`); `run_eqtl_mixture_prior_gibbs.py` / `.sh` (loads input, applies the fold, fits, writes section 6); with `--tempered`, `eqtl_mixture_prior_tempered_gibbs.py` (section 5b), or with `--tempered --tgs_mode gwfm`, `eqtl_mixture_prior_gwfm_tempered_gibbs.py` (section 5c) | tissue × fold (× sampler) |
-| 2'. Fit, fixed-grid prior | `eqtl_grid_prior_gibbs.py`, `eqtl_grid_prior_gwfm_tempered_gibbs.py`, `run_eqtl_grid_prior_gibbs.py` / `.sh` (section 5e); outputs as step 2, plus the grid weights; optional 9th argument of the `.sh`, the number of variant-count bins (section 5g) | tissue × fold (× sampler) |
-| 2''. Prior check | `check_prior_self_consistency.py` / `.sh` (section 5f): one posterior sample per gene against the fitted prior | tissue × fit (fold 1) |
-| 2'''. Prior by annotation | `check_prior_by_variant_annotation.py` / `.sh` (section 5h): posterior against prior rates of large effects and $\beta^2$ by MAF, TSS distance and in-window LD score; per-gene variant composition | tissue × fit × fold |
-| 1'. Simulated input | `simulate_gibbs_input.py` (section 5j): genotypes with LD, expression from a chosen prior (shared, MAF, TSS distance, gene classes), in the format of step 1 plus `truth.npz` | scenario |
+| 2. Fit, spike and two slab | `eqtl_mixture_prior_gibbs.py` (numba kernels and the `EQTL_MIXTURE_PRIOR_GIBBS` class, as `cofine.py`); `run_eqtl_mixture_prior_gibbs.py` / `.sh` (loads input, applies the fold, fits, writes section 6); with `--gwfm`, `eqtl_mixture_prior_gwfm_tempered_gibbs.py` (section 5c) | tissue × fold × sampler |
+| 2. Fit, fixed-grid prior, without and with gene classes | `eqtl_grid_prior_gibbs.py`, `run_eqtl_grid_prior_gibbs.py` / `.sh` (section 5e); with `--gwfm`, `eqtl_grid_prior_gwfm_tempered_gibbs.py`; outputs as step 2, plus the grid weights. Optional arguments of the `.sh`: 8th the sampler (`gibbs` or `gwfm`), 9th the prior's structure (`gene_classes_5`, section 5j; or a number of variant-count bins, section 5g) | tissue × fold × sampler |
 | (shared) | `posterior_beta_samples.py`: write and load the sparse effect samples, and compute $u^{(s)}$ for any genotype matrix | — |
-| 3. Evaluate | `evaluate_held_out_expression_prediction.py` / `.sh` (section 7): loads the effect samples and the fold's training and held-out dosages and expression from the step 1 input; optional 6th argument `split_samples` for `--split_samples` (section 11, issue 4) | tissue × fold |
-| 4. Organize and plot | `organize_and_visualize_cross_validation_results.sh`, calling `organize_cross_validation_results.py` and `visualize_cross_validation_results.R` (section 8); optional 6th argument, the suffix of the evaluation files (`_split_samples`), appended to the tissue in the output names | tissue |
-| 4'. Expression FSR excess | `check_expression_fsr_excess.py` (login node, seconds): on the step 4 per-gene file, the excess $1[r_{obs} < 0] -$ `expression_FSR` of the genes with FSR in 0.1 to 0.4 by decile of `n_cis_variants`, by `n_cis_variants` tercile × training LRT p-value, and regressed on both and the FSR, with standard errors clustered by gene (separates the correlated stratifiers of plot 3e); with `--gene_composition_file`, also on the variant composition of each window (section 5h) | tissue |
-| 4'''. Gene classes | `visualize_gene_classes.sh`, calling `organize_gene_classes.py` and `visualize_gene_classes.R` (section 8, plot 9), after step 4 | tissue × gene-class fit |
-| 4''. Sampler agreement | `compare_sampler_fits.py` (login node): per-gene observed $r$ of two fits of the same model against the Monte Carlo noise expected from `y_hat_mc_variance`, by decile of `n_cis_variants` (mixing check) | tissue × pair of fits |
-| 3'. Gene-pair null | `evaluate_gene_pair_null.py` / `.sh` (section 5i): each gene's held-out prediction against the held-out expression of every gene on another chromosome; `check_gene_pair_null.py` (login node) summarizes it by `n_cis_variants` and training LRT p-value and compares the FSR excess it predicts with the observed | tissue × fold |
+| 3. Evaluate | `evaluate_held_out_expression_prediction.py` / `.sh` (section 7): loads the effect samples and the fold's training and held-out dosages and expression from the step 1 input; optional 6th argument `split_samples` for `--split_samples` (section 11, issue 4), which the driver uses for every model | tissue × fold × model |
+| 4. Organize and plot | `organize_and_visualize_cross_validation_results.sh`, calling `organize_cross_validation_results.py` and `visualize_cross_validation_results.R` (section 8); optional 6th argument, the suffix of the evaluation files (`_split_samples`), appended to the tissue in the output names | tissue × model |
+| 4b. Gene classes | `visualize_gene_classes.sh`, calling `organize_gene_classes.py` and `visualize_gene_classes.R` (section 8, plot 9), after step 4 | tissue × gene-class fit |
 
 For testing, `run_eqtl_mixture_prior_gibbs.py` takes `--max_genes` and `--chromosomes`.
 

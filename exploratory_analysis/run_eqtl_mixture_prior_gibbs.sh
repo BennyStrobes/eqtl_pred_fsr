@@ -12,23 +12,15 @@ output_stem=${4}
 n_iters=${5}
 burn_in=${6}
 thin=${7}
-# Optional: "tempered" fits with the full tempered Gibbs sampler (README.md, section 5b), "tempered_gwfm" with the GWFM-style one (section 5c);
-# give each its own output_stem. Default "standard"
-sampler=${8:-standard}
-# Optional: hyperparameter_trace.txt of another fit, to start the hyper-parameters at its last iteration (--init_hyperparameters_from)
-init_trace=${9:-}
+# Optional: "gwfm" fits with the GWFM-style tempered Gibbs sampler (README.md, section 5c); give each its own output_stem. Default "gibbs"
+sampler=${8:-gibbs}
 
 sampler_args=""
-if [ "${sampler}" = "tempered" ]; then
-	sampler_args="--tempered"
-elif [ "${sampler}" = "tempered_gwfm" ]; then
-	sampler_args="--tempered --tgs_mode gwfm"
-elif [ "${sampler}" != "standard" ]; then
+if [ "${sampler}" = "gwfm" ]; then
+	sampler_args="--gwfm"
+elif [ "${sampler}" != "gibbs" ]; then
 	echo "unknown sampler: ${sampler}"
 	exit 1
-fi
-if [ -n "${init_trace}" ]; then
-	sampler_args="${sampler_args} --init_hyperparameters_from ${init_trace}"
 fi
 
 source ~/.bash_profile

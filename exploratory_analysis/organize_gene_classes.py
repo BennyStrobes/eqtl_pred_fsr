@@ -12,8 +12,8 @@ import numpy as np
 # Class labels mean nothing between folds, and an empty class says nothing about the data:
 #   - Within a fold, classes are ranked by the posterior mean weight of the large group (variance >= --small_large_cutoff, the part of the prior
 #     that is identified, README.md, section 5e), so rank 1 is the class with the fewest identified effects per variant. Ranks of different folds
-#     are only comparable as positions along that ordering. The ranking assumes the labels do not switch within a chain: with thousands of genes a
-#     class would have to swap all of its genes at once. The traces of plot 9c show it (a switch would appear as two classes crossing).
+#     are only comparable as positions along that ordering. The ranking is of a label's whole chain, so it means little for a class that empties and
+#     fills again with different content, which small classes do (plot 9c shows it). Ignore the class-level summaries of classes under about 1% of genes.
 #   - A class holding no genes in a sample has grid weights drawn from the Dirichlet prior, so class summaries use only the samples in which the
 #     class holds at least one gene. Classes with fewer than --min_class_genes genes on average have no rank (rank NA) and are not plotted.
 # The gene-level quantities do not depend on any of this: in each retained sample a gene takes the weights of the class it is in, and the

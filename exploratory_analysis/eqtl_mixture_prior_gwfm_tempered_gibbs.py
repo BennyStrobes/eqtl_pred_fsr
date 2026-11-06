@@ -2,7 +2,6 @@ import numpy as np
 import time
 from numba import njit, prange
 from eqtl_mixture_prior_gibbs import EQTL_MIXTURE_PRIOR_GIBBS, _seed_numba, _recompute_residuals_numba, _gibbs_sweep_numba
-from eqtl_mixture_prior_tempered_gibbs import _tgs_conditional, build_sparse_ld_neighbours
 
 
 ###############################################################################
@@ -10,8 +9,8 @@ from eqtl_mixture_prior_tempered_gibbs import _tgs_conditional, build_sparse_ld_
 # identical. It follows the --gwfm analysis of GCTB (Wu et al. 2025, Nature Genetics; algorithm "TGS_thin" of ApproxBayesRC in
 # github.com/jianzeng/GCTB, scr/model.cpp, sampleFromTGS_eigen): the standard Gibbs sweep of eqtl_mixture_prior_gibbs.py every iteration,
 # plus, every gwfm_interval iterations, tempered Gibbs (TGS) blocks on small sets of variants in near-perfect LD, which is where single-site
-# Gibbs fails to move an effect between LD partners. Unlike eqtl_mixture_prior_tempered_gibbs.py, every other variant and every
-# hyper-parameter is sampled by plain Gibbs, so the cost is close to the standard sampler's.
+# Gibbs fails to move an effect between LD partners. Every other variant and every hyper-parameter is sampled by plain Gibbs, so the cost
+# is close to the standard sampler's.
 #
 # TGS block (every gwfm_interval iterations, after the Gibbs sweep): for every variant j of a gene, in order, whose running PIP (mean over
 # the previous iterations of its Rao-Blackwellized PIP) is >= gwfm_pip_threshold, and that has at least one variant of the gene in
@@ -29,6 +28,53 @@ from eqtl_mixture_prior_tempered_gibbs import _tgs_conditional, build_sparse_ld_
 #     effects over the block replace the members' Gibbs contributions of this iteration to the PIPs, slab probabilities and posterior means
 #     (as GCTB replaces the members' PIPs).
 ###############################################################################
+
+
+@njit(cache=True)
+def _tgs_conditional(jj, t, dL1, dL2, a1, a2, P):
+    # Full conditional class probabilities of local variant jj given t = b^2 (b its single-variant regression coefficient) -> P[jj, :];
+    # the log odds of slab c against the spike are dL_c + a_c t
+    L1 = dL1 + a1 * t
+    L2 = dL2 + a2 * t
+    if L1 < 700.0 and L2 < 700.0:
+        e1 = np.exp(L1)
+        e2 = np.exp(L2)
+        P0 = 1.0 / (1.0 + e1 + e2)
+        P[jj, 0] = P0
+        P[jj, 1] = e1 * P0
+        P[jj, 2] = e2 * P0
+    else:
+        mx = max(L1, L2)
+        w0 = np.exp(-mx)
+        w1 = np.exp(L1 - mx)
+        w2 = np.exp(L2 - mx)
+        tot = w0 + w1 + w2
+        P[jj, 0] = w0 / tot
+        P[jj, 1] = w1 / tot
+        P[jj, 2] = w2 / tot
+
+
+def build_sparse_ld_neighbours(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, r2_threshold):
+    # Per gene, the training-fold LD R = X_g' X_g / n of its variants; returns the CSR lists (one row per variant-gene pair, local indices
+    # within the gene) of the variants in LD r^2 >= r2_threshold with each variant, itself included
+    n = G.shape[1]
+    counts = np.zeros(len(gene_var_idx), dtype=np.int64)
+    idx_list = []
+    for g in range(len(gene_var_ptr) - 1):
+        start = gene_var_ptr[g]
+        end = gene_var_ptr[g + 1]
+        rows = gene_var_idx[start:end]
+        X = (G[rows].astype(np.float32) - var_mean[rows, None].astype(np.float32)) / var_sd[rows, None].astype(np.float32)
+        R = np.dot(X, X.T) / n
+        np.fill_diagonal(R, 1.0)
+        R = np.clip(R, -1.0, 1.0)
+        keep = np.square(R) >= r2_threshold
+        np.fill_diagonal(keep, True)
+        counts[start:end] = np.sum(keep, axis=1)
+        idx_list.append(np.nonzero(keep)[1].astype(np.int16))
+    nbr_ptr = np.zeros(len(gene_var_idx) + 1, dtype=np.int64)
+    nbr_ptr[1:] = np.cumsum(counts)
+    return nbr_ptr, np.concatenate(idx_list)
 
 
 @njit(parallel=True, cache=True)
@@ -275,6 +321,6 @@ class EQTL_MIXTURE_PRIOR_GWFM_TEMPERED_GIBBS(EQTL_MIXTURE_PRIOR_GIBBS):
         if np.max(np.diff(gene_var_ptr)) > 32767:
             raise ValueError('a gene has more than 32767 variants (int16 neighbour indices)')
         t0 = time.time()
-        self.fr_ptr, self.fr_idx, _ = build_sparse_ld_neighbours(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, self.gwfm_r2_threshold)
+        self.fr_ptr, self.fr_idx = build_sparse_ld_neighbours(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, self.gwfm_r2_threshold)
         set_sizes = np.diff(self.fr_ptr)
         print('GWFM tempered Gibbs: interval=' + str(self.gwfm_interval) + ' r2_threshold=' + str(self.gwfm_r2_threshold) + ' pip_threshold=' + str(self.gwfm_pip_threshold) + ' steps_per_snp=' + str(self.gwfm_steps_per_snp) + ' min_steps=' + str(self.gwfm_min_steps) + '; %.1f%% of variants have an LD partner, mean set size %.1f among them (built in %.0f sec)' % (100.0 * np.mean(set_sizes > 1), np.mean(set_sizes[set_sizes > 1]) if np.any(set_sizes > 1) else 0.0, time.time() - t0), flush=True)

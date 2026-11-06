@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -c 1                               # Request one core (genes run in parallel through numba prange if given more)
-#SBATCH -t 4-00:00                        # Runtime in D-HH:MM format
+#SBATCH -t 2-30:00                        # Runtime in D-HH:MM format
 #SBATCH -p bch-compute                           # Partition to run in
 #SBATCH --mem=40G                        # Memory total in MiB (for all cores): int8 training genotypes and the sparse effect samples are held in memory
 
@@ -13,8 +13,8 @@ n_iters=${5}
 burn_in=${6}
 thin=${7}
 # Optional: "gwfm" fits the fixed-grid prior with the GWFM-style tempered Gibbs sampler (README.md, section 5e); give each its own
-# output_stem. Default "standard"
-sampler=${8:-standard}
+# output_stem. Default "gibbs"
+sampler=${8:-gibbs}
 # Optional: the prior's structure. Default: one shared prior. A number B: B variant-count bins, each with its own inclusion probability
 # (README.md, section 5g). maf or tss_distance: grid weights per bin of the variant's MAF or distance to the TSS; gene_classes_L: L latent gene
 # classes with grid weights per class (README.md, section 5j)
@@ -27,7 +27,7 @@ sigma2_e_prior=${11:-fixed}
 sampler_args=""
 if [ "${sampler}" = "gwfm" ]; then
 	sampler_args="--gwfm"
-elif [ "${sampler}" != "standard" ]; then
+elif [ "${sampler}" != "gibbs" ]; then
 	echo "unknown sampler: ${sampler}"
 	exit 1
 fi
