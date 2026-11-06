@@ -15,6 +15,20 @@ from posterior_beta_samples import save_posterior_beta_samples
 # of eqtl_grid_prior_gibbs.py). Give each fit its own --output_stem. Additional outputs (<output_stem>_*):
 #   grid_weight_trace.txt: weight of every grid component after every iteration (retained = 1 for retained samples)
 #   grid_weight_summary.txt: per component, its variance, group, and posterior mean weight with 95% interval over the retained samples
+# With --n_variant_bins (an inclusion probability q_b per equal-count bin of the number of cis variants; README.md, section 5g), also:
+#   variant_bin_trace.txt: q_b of every bin after every iteration (retained = 1 for retained samples)
+#   variant_bin_summary.txt: per bin, its range of cis variant counts, numbers of genes and pairs, posterior mean q_b with 95% interval over the
+#       retained samples, and the posterior mean fraction of its variants in the large group (identified, unlike q_b)
+# grid_weight_trace / grid_weight_summary then hold the prior averaged over all variant-gene pairs.
+# With --variant_categories maf or tss_distance (grid weights per bin of the pair's training-fold MAF, --maf_edges, or of its distance to the
+# gene's TSS, --tss_distance_edges) or --n_gene_classes (latent gene classes with grid weights per class; README.md, section 5j), also:
+#   prior_rows.npz: row_labels, row_weight_trace (n_iters x rows x (K + 1): the grid weights of every category or class after every iteration),
+#       retained, grid_var; for categories pair_category (the category of every pair); for gene classes gene_class_samples (n_samples x n_genes)
+#       and gene_class_weight_trace (n_iters x classes)
+#   prior_row_summary.txt: per category or class, its pairs (and genes, for classes; posterior means), and the posterior mean and 95% interval
+#       of its inclusion probability 1 - pi_spike, of its large-group weight and of its prior E[beta^2] (per-variant cis-h2); classes are
+#       summarized by label over the retained samples, which assumes no label switching after burn-in (check the trace)
+# grid_weight_trace / grid_weight_summary then also hold the prior averaged over all variant-gene pairs.
 
 
 def load_in_fold_file(fold_file):
@@ -132,6 +146,16 @@ parser.add_argument('--min_maf', type=float, default=0.01)  # training-fold mino
 parser.add_argument('--chromosomes', type=int, nargs='+', default=None)  # only these chromosomes (for testing)
 parser.add_argument('--max_genes', type=int, default=None)  # only the first max_genes genes (for testing)
 parser.add_argument('--seed', type=int, default=1)
+parser.add_argument('--n_variant_bins', type=int, default=None)  # inclusion probability per equal-count bin of the number of cis variants (default: one shared prior)
+parser.add_argument('--variant_categories', type=str, default=None, choices=['maf', 'tss_distance'])  # grid weights per bin of the pair's MAF or TSS distance
+parser.add_argument('--maf_edges', type=float, nargs='+', default=[0.0, 0.02, 0.05, 0.1, 0.2])  # --variant_categories maf: training-fold MAF bins (last: to 0.5)
+parser.add_argument('--tss_distance_edges', type=float, nargs='+', default=[0, 2000, 5000, 10000, 20000, 50000])  # --variant_categories tss_distance: |position - TSS| bins (last: to the window edge)
+parser.add_argument('--n_gene_classes', type=int, default=None)  # latent gene classes, each with its own grid weights
+parser.add_argument('--gene_class_alpha', type=float, default=1.0)  # Dirichlet prior on the weights of the gene classes
+parser.add_argument('--ncp_moves', type=int, default=0)  # non-centred moves of the grid weights per iteration (shared prior; README.md, section 5k)
+parser.add_argument('--ncp_target_flips', type=float, default=200)  # variants switching component in a typical non-centred move
+parser.add_argument('--no_gene_class_moves', action='store_true')  # gene classes without the non-centred class move (for comparison)
+parser.add_argument('--hierarchical_sigma2_e', action='store_true')  # learn the Inverse-Gamma prior of the residual variances (README.md, section 5k)
 parser.add_argument('--gwfm', action='store_true')  # fit with the GWFM-style tempered Gibbs sampler (eqtl_grid_prior_gwfm_tempered_gibbs.py)
 parser.add_argument('--gwfm_interval', type=int, default=10)  # gwfm only: TGS blocks every this many iterations
 parser.add_argument('--gwfm_r2_threshold', type=float, default=0.95)  # gwfm only: LD r^2 defining a variant's set
@@ -146,17 +170,33 @@ print('settings: ' + ' '.join(key + '=' + str(value) for key, value in vars(args
 genotype_index_to_fold = load_in_fold_file(args.fold_file)
 data = load_in_training_data(args.gibbs_input_summary_file, genotype_index_to_fold, args.held_out_fold, args.min_maf, args.chromosomes, args.max_genes)
 
+# Variant category of every pair: bins [edges[i], edges[i + 1]), the last bin open-ended
+pair_category = None
+category_labels = None
+gene_var_idx = data['gene_var_idx']
+if args.variant_categories is not None:
+    if args.variant_categories == 'maf':
+        af = data['var_mean'][gene_var_idx] / 2.0
+        values, edges, unit = np.minimum(af, 1.0 - af), np.asarray(args.maf_edges), 'MAF'
+    else:
+        position = np.asarray([int(variant_id.split('_')[1]) for variant_id in data['var_ids'][gene_var_idx].astype(str)])
+        values, edges, unit = np.abs(position - np.repeat(data['gene_tss'], np.diff(data['gene_var_ptr']))), np.asarray(args.tss_distance_edges), 'TSS distance'
+    pair_category = np.clip(np.searchsorted(edges, values, side='right') - 1, 0, len(edges) - 1)
+    category_labels = [unit + ' ' + ('%g' % edges[i]) + (' to ' + ('%g' % edges[i + 1]) if i + 1 < len(edges) else '+') for i in range(len(edges))]
+
 # Fit
 model_args = dict(n_iters=args.n_iters, burn_in=args.burn_in, thin=args.thin, dirichlet_alpha=args.dirichlet_alpha, inverse_gamma_a=args.inverse_gamma_a, inverse_gamma_b=args.inverse_gamma_b,
-                  grid_variances=args.grid_variances, small_large_cutoff=args.small_large_cutoff, seed=args.seed)
+                  grid_variances=args.grid_variances, small_large_cutoff=args.small_large_cutoff, n_variant_bins=args.n_variant_bins,
+                  variant_category_labels=category_labels, n_gene_classes=args.n_gene_classes, gene_class_alpha=args.gene_class_alpha,
+                  ncp_moves=args.ncp_moves, ncp_target_flips=args.ncp_target_flips, hierarchical_sigma2_e=args.hierarchical_sigma2_e,
+                  gene_class_moves=not args.no_gene_class_moves, seed=args.seed)
 if args.gwfm:
     model = EQTL_GRID_PRIOR_GWFM_TEMPERED_GIBBS(gwfm_interval=args.gwfm_interval, gwfm_r2_threshold=args.gwfm_r2_threshold, gwfm_pip_threshold=args.gwfm_pip_threshold, gwfm_steps_per_snp=args.gwfm_steps_per_snp, gwfm_min_steps=args.gwfm_min_steps, **model_args)
 else:
     model = EQTL_GRID_PRIOR_GIBBS(**model_args)
-model.fit(data['G'], data['var_mean'], data['var_sd'], data['gene_var_ptr'], data['gene_var_idx'], data['Y'])
+model.fit(data['G'], data['var_mean'], data['var_sd'], data['gene_var_ptr'], data['gene_var_idx'], data['Y'], pair_category=pair_category)
 
 # Sparse effect samples (one entry per variant-gene pair: a variant in several genes' windows appears once per gene)
-gene_var_idx = data['gene_var_idx']
 save_posterior_beta_samples(args.output_stem + '_posterior_beta_samples.npz', {
     'gene_ids': data['gene_ids'].astype('S'), 'gene_chroms': data['gene_chroms'], 'gene_tss': data['gene_tss'], 'gene_pair_ptr': data['gene_var_ptr'],
     'pair_variant_ids': data['var_ids'][gene_var_idx], 'pair_train_mean': data['var_mean'][gene_var_idx], 'pair_train_sd': data['var_sd'][gene_var_idx],
@@ -203,4 +243,53 @@ for index, name in enumerate(model.grid_weight_names):
     group = ['spike', 'small', 'large'][model.comp_group[index] + 1]
     t.write(name + '\t' + str(model.grid_var[index]) + '\t' + group + '\t' + str(np.mean(retained_trace[:, index])) + '\t' + str(np.quantile(retained_trace[:, index], 0.025)) + '\t' + str(np.quantile(retained_trace[:, index], 0.975)) + '\n')
 t.close()
+# Variant-count bins: q_b trace, and per-bin summary
+if args.n_variant_bins is not None:
+    trace = model.bin_q_trace
+    t = open(args.output_stem + '_variant_bin_trace.txt', 'w')
+    t.write('iteration\tretained\t' + '\t'.join('q_bin_' + str(b + 1) for b in range(model.n_variant_bins)) + '\n')
+    for itera in range(trace.shape[0]):
+        t.write(str(itera) + '\t' + str(int(model.retained[itera])) + '\t' + '\t'.join(str(value) for value in trace[itera]) + '\n')
+    t.close()
+    retained_trace = trace[model.retained]
+    gene_n_vars = np.diff(ptr)
+    t = open(args.output_stem + '_variant_bin_summary.txt', 'w')
+    t.write('bin\tmin_cis_variants\tmax_cis_variants\tmean_cis_variants\tn_genes\tn_pairs\tq_posterior_mean\tq_posterior_95_lb\tq_posterior_95_ub\tlarge_group_fraction\n')
+    for b in range(model.n_variant_bins):
+        in_bin = model.gene_bin == b
+        t.write(str(b + 1) + '\t' + str(np.min(gene_n_vars[in_bin])) + '\t' + str(np.max(gene_n_vars[in_bin])) + '\t' + str(np.mean(gene_n_vars[in_bin])) + '\t' + str(model.bin_n_genes[b]) + '\t' + str(int(model.bin_n_pairs[b])) + '\t' + str(np.mean(retained_trace[:, b])) + '\t' + str(np.quantile(retained_trace[:, b], 0.025)) + '\t' + str(np.quantile(retained_trace[:, b], 0.975)) + '\t' + str(model.bin_large_fraction[b]) + '\n')
+    t.close()
+# Variant categories or gene classes: weights of every row, and per-row summary
+if model.prior_mode in ['variant_categories', 'gene_classes']:
+    if model.prior_mode == 'variant_categories':
+        row_labels = category_labels
+        extra = {'pair_category': pair_category.astype(np.int8)}
+        row_pairs = np.tile(model.row_n_pairs.astype(float), (model.n_samples, 1))
+        row_genes = None
+    else:
+        row_labels = ['gene class ' + str(l + 1) for l in range(model.n_gene_classes)]
+        extra = {'gene_class_samples': model.gene_class_samples, 'gene_class_weight_trace': model.gene_class_weight_trace}
+        gene_n_vars = np.diff(data['gene_var_ptr'])
+        row_genes = np.asarray([np.bincount(c, minlength=model.n_gene_classes) for c in model.gene_class_samples.astype(np.int64)])
+        row_pairs = np.asarray([np.bincount(c, weights=gene_n_vars, minlength=model.n_gene_classes) for c in model.gene_class_samples.astype(np.int64)])
+    np.savez(args.output_stem + '_prior_rows.npz', row_labels=np.asarray(row_labels).astype('S'), row_weight_trace=model.row_weight_trace, retained=model.retained, grid_var=model.grid_var, **extra)
+    weights = model.row_weight_trace[model.retained].astype(np.float64)  # n_samples x rows x (K + 1)
+    inclusion = 1.0 - weights[:, :, 0]
+    large = np.sum(weights[:, :, model.comp_group == 1], axis=2)
+    beta2 = np.sum(weights * model.grid_var[None, None, :], axis=2)
+    t = open(args.output_stem + '_prior_row_summary.txt', 'w')
+    t.write('row\tlabel\tn_pairs\tn_genes\tinclusion_mean\tinclusion_95_lb\tinclusion_95_ub\tlarge_weight_mean\tlarge_weight_95_lb\tlarge_weight_95_ub\tprior_beta2_mean\tprior_beta2_95_lb\tprior_beta2_95_ub\n')
+    for r, label in enumerate(row_labels):
+        line = [str(r + 1), label, str(np.mean(row_pairs[:, r])), str(np.mean(row_genes[:, r])) if row_genes is not None else 'NA']
+        for values in [inclusion[:, r], large[:, r], beta2[:, r]]:
+            line += [str(np.mean(values)), str(np.quantile(values, 0.025)), str(np.quantile(values, 0.975))]
+        t.write('\t'.join(line) + '\n')
+    t.close()
+# Learned residual-variance prior: (a, b) after every iteration
+if args.hierarchical_sigma2_e:
+    t = open(args.output_stem + '_sigma2_e_prior_trace.txt', 'w')
+    t.write('iteration\tretained\tig_a\tig_b\n')
+    for itera in range(model.n_iters):
+        t.write(str(itera) + '\t' + str(int(model.retained[itera])) + '\t' + str(model.sigma2_e_prior_trace[itera, 0]) + '\t' + str(model.sigma2_e_prior_trace[itera, 1]) + '\n')
+    t.close()
 print(str(len(data['gene_ids'])) + ' genes written to ' + args.output_stem + '_*')

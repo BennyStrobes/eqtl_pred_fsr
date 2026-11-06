@@ -10,12 +10,19 @@ fold_file=${2}
 held_out_fold=${3}
 gibbs_results_stem=${4}
 output_file=${5}
+# Optional: "split_samples" for y_hat and the expected quantities from separate blocks of retained samples (--split_samples)
+split_samples=${6:-}
+
+split_args=""
+if [ "${split_samples}" == "split_samples" ]; then
+	split_args="--split_samples"
+fi
 
 source ~/.bash_profile
 conda activate plink_env
 
 date
 
-python evaluate_held_out_expression_prediction.py --gibbs_input_summary_file ${gibbs_input_summary_file} --fold_file ${fold_file} --held_out_fold ${held_out_fold} --gibbs_results_stem ${gibbs_results_stem} --output_file ${output_file}
+python evaluate_held_out_expression_prediction.py --gibbs_input_summary_file ${gibbs_input_summary_file} --fold_file ${fold_file} --held_out_fold ${held_out_fold} --gibbs_results_stem ${gibbs_results_stem} --output_file ${output_file} ${split_args}
 
 date

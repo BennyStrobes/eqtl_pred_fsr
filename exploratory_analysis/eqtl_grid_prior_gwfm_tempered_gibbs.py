@@ -22,12 +22,12 @@ from eqtl_mixture_prior_tempered_gibbs import build_sparse_ld_neighbours
 
 
 @njit(cache=True)
-def _grid_conditional(a, b2, const, half_inv_var, P):
-    # P[a, :] = full conditional class probabilities of a variant with single-variant coefficient b (b2 = b^2)
+def _grid_conditional(a, b2, log_pi_row, const, half_inv_var, P):
+    # P[a, :] = full conditional class probabilities of a variant with single-variant coefficient b (b2 = b^2) and log prior weights log_pi_row
     n_comp = const.shape[0]
     mx = -np.inf
     for c in range(n_comp):
-        P[a, c] = const[c] - half_inv_var[c] * b2
+        P[a, c] = log_pi_row[c] + const[c] - half_inv_var[c] * b2
         if P[a, c] > mx:
             mx = P[a, c]
     tot = 0.0
@@ -39,9 +39,10 @@ def _grid_conditional(a, b2, const, half_inv_var, P):
 
 
 @njit(parallel=True, cache=True)
-def _grid_gwfm_tgs_numba(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, fr_ptr, fr_idx, resid, beta, z, sigma2_e, log_pi, grid_var, comp_group,
-                         running_pip, pip_threshold, steps_per_snp, min_steps, it_p_group, it_beta, class_counts, stats):
+def _grid_gwfm_tgs_numba(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, fr_ptr, fr_idx, resid, beta, z, sigma2_e, log_pi, pair_row, grid_var,
+                         comp_group, running_pip, pip_threshold, steps_per_snp, min_steps, it_p_group, it_beta, class_counts, stats):
     # TGS blocks of every gene (see top of file). On entry resid[g] = y_g - X_g beta_g; z, beta and resid are updated in place.
+    # log_pi (n_rows x (K + 1)): log prior weights of the components, one row per prior; pair_row (n_pairs): the row of each variant-gene pair
     # fr_ptr / fr_idx: CSR lists (per pair, itself included; local indices within the gene) of the variants in LD r^2 >= gwfm_r2_threshold
     # it_p_group / it_beta: this iteration's contributions to the group probabilities and effects; overwritten for the members of every block
     # class_counts: recomputed for the genes with at least one block
@@ -59,7 +60,7 @@ def _grid_gwfm_tgs_numba(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, fr_ptr
         post_sd = np.empty(n_comp)
         for c in range(n_comp):
             total_var = grid_var[c] + v_g
-            const[c] = log_pi[c] - 0.5 * np.log(total_var)
+            const[c] = -0.5 * np.log(total_var)
             half_inv_var[c] = 0.5 / total_var
             shrink[c] = grid_var[c] / total_var
             post_sd[c] = np.sqrt(grid_var[c] * v_g / total_var)
@@ -107,7 +108,7 @@ def _grid_gwfm_tgs_numba(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, fr_ptr
                 z_S[a] = z_start[a]
             P = np.empty((m_set, n_comp))
             for a in range(m_set):
-                _grid_conditional(a, b_S[a] * b_S[a], const, half_inv_var, P)
+                _grid_conditional(a, b_S[a] * b_S[a], log_pi[pair_row[start + S[a]]], const, half_inv_var, P)
 
             # TGS sub-steps, with the weighted reservoir (res_*) and the weighted Rao-Blackwellized sums
             n_steps = max(min_steps, int(steps_per_snp * m_set + 0.5))
@@ -165,7 +166,7 @@ def _grid_gwfm_tgs_numba(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, fr_ptr
                     for a in range(m_set):
                         if a != sel:
                             b_S[a] -= d * R[a, sel]
-                            _grid_conditional(a, b_S[a] * b_S[a], const, half_inv_var, P)
+                            _grid_conditional(a, b_S[a] * b_S[a], log_pi[pair_row[start + S[a]]], const, half_inv_var, P)
 
             # End in the resampled sub-state: residual, chain state, and this iteration's contributions of the members
             for a in range(m_set):
@@ -214,19 +215,19 @@ class EQTL_GRID_PRIOR_GWFM_TEMPERED_GIBBS(EQTL_GRID_PRIOR_GIBBS):
             return super().sweep(itera, G, var_mean, var_sd, gene_var_ptr, gene_var_idx)
         self.it_p_group[:] = 0.0
         self.it_beta[:] = 0.0
-        log_pi = np.log(self.pi)
-        _grid_gibbs_sweep_numba(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, self.resid, self.beta, self.z, self.sigma2_e, log_pi, self.grid_var,
-                                self.comp_group, self.ig_a, self.ig_b, self.it_p_group, self.it_beta, self.class_counts)
+        log_pi, pair_row = self.prior_table()
+        _grid_gibbs_sweep_numba(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, self.resid, self.beta, self.z, self.sigma2_e, log_pi, pair_row, self.grid_var,
+                                self.comp_group, self.ig_a, self.ig_b, self.sigma2_e_fixed is None, self.it_p_group, self.it_beta, self.class_counts)
         running_pip = np.sum(self.sum_p_group, axis=1) / itera
         _grid_gwfm_tgs_numba(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, self.fr_ptr, self.fr_idx, self.resid, self.beta, self.z, self.sigma2_e,
-                             log_pi, self.grid_var, self.comp_group, running_pip, self.gwfm_pip_threshold, self.gwfm_steps_per_snp, self.gwfm_min_steps,
+                             log_pi, pair_row, self.grid_var, self.comp_group, running_pip, self.gwfm_pip_threshold, self.gwfm_steps_per_snp, self.gwfm_min_steps,
                              self.it_p_group, self.it_beta, self.class_counts, self.stats)
         self.sum_p_group += self.it_p_group
         self.sum_beta += self.it_beta
         return ' tgs_blocks=%d tgs_class_changes=%d' % (np.sum(self.stats[:, 0]), np.sum(self.stats[:, 1]))
 
-    def initialize(self, G, var_mean, var_sd, gene_var_ptr, gene_var_idx, Y):
-        super().initialize(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, Y)
+    def initialize(self, G, var_mean, var_sd, gene_var_ptr, gene_var_idx, Y, pair_category=None):
+        super().initialize(G, var_mean, var_sd, gene_var_ptr, gene_var_idx, Y, pair_category)
         if np.max(np.diff(gene_var_ptr)) > 32767:
             raise ValueError('a gene has more than 32767 variants (int16 neighbour indices)')
         self.it_p_group = np.zeros((self.n_pairs, 2))

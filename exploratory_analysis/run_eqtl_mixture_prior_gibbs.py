@@ -20,6 +20,8 @@ from posterior_beta_samples import save_posterior_beta_samples
 #   gene_summary.txt: per gene, number of variants, sum of PIPs, max PIP, expected number of variants in each slab, posterior mean residual variance
 #   hyperparameter_trace.txt: hyper-parameters after every iteration (retained = 1 for retained samples)
 #   hyperparameter_summary.txt: posterior mean and 95% interval over the retained samples
+# --init_hyperparameters_from <hyperparameter_trace.txt of another fit>: start (pi0, pi1, pi2, sigma2_1, sigma2_2) at the last iteration of
+# that fit instead of the defaults (e.g. a fast sampler started where a slow one ended; README.md, section 11)
 
 
 def load_in_fold_file(fold_file):
@@ -135,6 +137,7 @@ parser.add_argument('--min_maf', type=float, default=0.01)  # training-fold mino
 parser.add_argument('--chromosomes', type=int, nargs='+', default=None)  # only these chromosomes (for testing)
 parser.add_argument('--max_genes', type=int, default=None)  # only the first max_genes genes (for testing)
 parser.add_argument('--seed', type=int, default=1)
+parser.add_argument('--init_hyperparameters_from', type=str, default=None)  # hyperparameter_trace.txt of another fit: start at its last iteration
 parser.add_argument('--tempered', action='store_true')  # fit with a tempered Gibbs sampler (see --tgs_mode)
 parser.add_argument('--tgs_mode', type=str, default='full', choices=['full', 'gwfm'])  # tempered only: full (eqtl_mixture_prior_tempered_gibbs.py) or gwfm (eqtl_mixture_prior_gwfm_tempered_gibbs.py)
 parser.add_argument('--tgs_epsilon', type=float, default=0.5)  # tempered only: weight of the uniform component of the tempered conditional
@@ -157,6 +160,12 @@ data = load_in_training_data(args.gibbs_input_summary_file, genotype_index_to_fo
 
 # Fit
 model_args = dict(n_iters=args.n_iters, burn_in=args.burn_in, thin=args.thin, dirichlet_alpha=args.dirichlet_alpha, inverse_gamma_a=args.inverse_gamma_a, inverse_gamma_b=args.inverse_gamma_b, seed=args.seed)
+if args.init_hyperparameters_from is not None:
+    # Last iteration of the other fit's trace; columns iteration, retained, pi0, pi1, pi2, sigma2_1, sigma2_2
+    last = np.loadtxt(args.init_hyperparameters_from, skiprows=1, ndmin=2)[-1]
+    model_args['pi_init'] = tuple(last[2:5] / np.sum(last[2:5]))
+    model_args['slab_var_init'] = (last[5], last[6])
+    print('hyper-parameters start at iteration ' + str(int(last[0])) + ' of ' + args.init_hyperparameters_from + ': pi = ' + ', '.join('%.4g' % v for v in model_args['pi_init']) + ', slab variances = ' + ', '.join('%.4g' % v for v in model_args['slab_var_init']), flush=True)
 if args.tempered and args.tgs_mode == 'gwfm':
     model = EQTL_MIXTURE_PRIOR_GWFM_TEMPERED_GIBBS(gwfm_interval=args.gwfm_interval, gwfm_r2_threshold=args.gwfm_r2_threshold, gwfm_pip_threshold=args.gwfm_pip_threshold, gwfm_steps_per_snp=args.gwfm_steps_per_snp, gwfm_min_steps=args.gwfm_min_steps, **model_args)
 elif args.tempered:

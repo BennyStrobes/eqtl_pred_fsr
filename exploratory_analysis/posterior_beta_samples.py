@@ -97,3 +97,10 @@ def compute_genetic_value_samples(samples, gene_index, aligned_dosage, found):
     # Genetic expression of each individual under each retained effect sample: n_samples x n_individuals (u^(s) = X beta^(s))
     X = standardize_aligned_dosage(samples, gene_index, aligned_dosage, found)
     return np.dot(gene_beta_sample_matrix(samples, gene_index), np.transpose(X))
+
+
+def compute_independent_snp_h2_samples(samples, gene_index, aligned_dosage, found):
+    # Var_i(X beta^(s)) of each retained effect sample with the correlations between variants set to 0: sum_j Var_i(x_j) (beta_j^(s))^2 (n_samples).
+    # Var_i(x_j) is about 1 (the dosages are standardized with the training mean and standard deviation), so this is about the sum of squared effects
+    X = standardize_aligned_dosage(samples, gene_index, aligned_dosage, found)
+    return np.dot(np.square(gene_beta_sample_matrix(samples, gene_index)), np.var(X, axis=0))

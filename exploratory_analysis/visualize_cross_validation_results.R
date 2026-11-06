@@ -141,6 +141,57 @@ genetic_calibration_df <- function(df) {
 	return(out)
 }
 
+mean_over_sqrt_mean <- function(numerator, denominator, cluster) {
+	# mean(numerator) / sqrt(mean(denominator)) with a delta-method standard error, as in genetic_calibration_df. NULL if mean(denominator) <= 0
+	a <- mean(numerator)
+	c <- mean(denominator)
+	if (c <= 0) {
+		return(NULL)
+	}
+	var_a <- cluster_cov_of_means(numerator, numerator, cluster)
+	var_c <- cluster_cov_of_means(denominator, denominator, cluster)
+	cov_ac <- cluster_cov_of_means(numerator, denominator, cluster)
+	var_ratio <- var_a / c - a * cov_ac / c^2 + a^2 * var_c / (4 * c^3)
+	return(list(value=a / sqrt(c), se=sqrt(max(var_ratio, 0))))
+}
+
+genetic_calibration_ld_corrected_df <- function(df) {
+	# genetic_calibration_df with HE corrected for the way it weights LD. r(y_hat, y) is about r(y_hat, u) sqrt(h2), so y = mean(observed_r) / sqrt(h2) estimates
+	# the genetic correlation, but HE over-counts eQTLs in high LD (README.md, section 8, plot 7e), so sqrt(mean(cis_snp_h2_he_test)) is too large. Per bin,
+	# h2 = mean(cis_snp_h2_he_test) x mean(expected_cis_h2) / mean(expected_cis_snp_h2_he_var_test). The ratio is Var(u) over the HE slope of the model's
+	# effects, u' W u. It does not change if every effect is rescaled, so the model sets only the LD correction and the size of h2 comes from the held-out
+	# expression. It is computed from bin means (a ratio per gene is unstable for weak genes) and treated as fixed in the standard error
+	rows <- list()
+	for (panel in levels(df$panel)) {
+		sub_df <- df[df$panel == panel & !is.na(df$expected_genetic_r) & !is.na(df$observed_r) & !is.na(df$cis_snp_h2_he_test) & !is.na(df$expected_cis_h2) &
+		             !is.na(df$expected_cis_snp_h2_he_var_test), ]
+		if (nrow(sub_df) < n_bins) {
+			next
+		}
+		bins <- equal_count_bins(sub_df$expected_genetic_r, n_bins)
+		for (bin in 1:n_bins) {
+			bin_df <- sub_df[bins == bin, ]
+			predicted_he <- mean(bin_df$expected_cis_snp_h2_he_var_test)
+			if (predicted_he <= 0) {
+				next
+			}
+			corrected <- mean_over_sqrt_mean(bin_df$observed_r, bin_df$cis_snp_h2_he_test * mean(bin_df$expected_cis_h2) / predicted_he, bin_df$gene_id)
+			if (is.null(corrected)) {
+				next
+			}
+			rows[[length(rows) + 1]] <- data.frame(panel=panel, bin=bin, n=nrow(bin_df),
+				x=mean(bin_df$expected_genetic_r), x_se=cluster_se_of_mean(bin_df$expected_genetic_r, bin_df$gene_id),
+				y=corrected$value, y_se=corrected$se)
+		}
+	}
+	if (length(rows) == 0) {
+		return(NULL)
+	}
+	out <- do.call(rbind, rows)
+	out$panel <- factor(out$panel, levels=fold_levels)
+	return(out)
+}
+
 fsr_calibration_df <- function(df, fsr_col) {
 	# One row per panel and FSR bin: mean FSR (expected) and fraction of genes with a negative observed correlation (observed)
 	rows <- list()
@@ -235,6 +286,15 @@ make_gene_level_plots <- function(df, gene_set_suffix, gene_set_label) {
 	if (!is.null(summary_df)) {
 		pp <- calibration_plot(summary_df, "Expected correlation with genetic expression", "Mean observed r / sqrt(mean held-out HE h2)") + ggtitle(paste0(tissue, ", ", gene_set_label))
 		save_plot(pp, "genetic_correlation_calibration", gene_set_suffix, panel_width, 3.4)
+	}
+	# The same with HE corrected for the way it weights LD (see genetic_calibration_ld_corrected_df). Evaluations made before these columns were added have no such plot
+	if ("expected_cis_snp_h2_he_var_test" %in% colnames(df)) {
+		summary_df <- genetic_calibration_ld_corrected_df(df)
+		if (!is.null(summary_df)) {
+			pp <- calibration_plot(summary_df, "Expected correlation with genetic expression", "Mean observed r / sqrt(LD-corrected held-out HE h2)") +
+				ggtitle(paste0(tissue, ", ", gene_set_label))
+			save_plot(pp, "genetic_correlation_calibration_ld_corrected", gene_set_suffix, panel_width, 3.4)
+		}
 	}
 
 	# 3. FSR calibration: fraction of genes with a negative observed correlation against the expression FSR (the calibration target) and the genetic FSR
@@ -408,6 +468,45 @@ make_gene_level_plots <- function(df, gene_set_suffix, gene_set_label) {
 	summary_df$training_estimate <- factor(summary_df$training_estimate, levels=c("Posterior, training", "HE, training"))
 	pp_b <- calibration_plot(summary_df, "Training-fold cis-h2", "Held-out HE cis-h2", row_var="training_estimate")
 	save_plot(plot_grid(pp_a, pp_b, ncol=1, rel_heights=c(1, 1.7)), "heritability_calibration", gene_set_suffix, panel_width, 9)
+
+	# 7b. The same on the scale of Var(genetic expression): cis_snp_h2_he_test is a proportion of the held-out variance of expression, while
+	# expected_cis_h2 is a variance. (a) held-out HE times var_y against expected cis-h2; (b) the held-out variance of expression, which is 1 if the
+	# two scales agree. Evaluations made before these columns were added have no such plot
+	if ("cis_snp_h2_he_var_test" %in% colnames(df)) {
+		summary_df <- binned_calibration_df(df, "expected_cis_h2", "cis_snp_h2_he_var_test")
+		pp_a <- calibration_plot(summary_df, "Expected cis-h2 (held-out individuals)", "Held-out HE cis-h2 x Var(y)") + ggtitle(paste0(tissue, ", ", gene_set_label))
+		summary_df <- binned_calibration_df(df, "expected_cis_h2", "var_y_test")
+		pp_b <- ggplot(summary_df, aes(x=x, y=y, color=panel)) +
+			geom_hline(yintercept=1, linetype="dashed", color="#7E8A97") +
+			geom_errorbar(aes(ymin=y - 1.96 * y_se, ymax=y + 1.96 * y_se), width=0) +
+			geom_line(linewidth=.35) +
+			geom_point(size=1.6) +
+			scale_color_manual(values=fold_colors, guide="none") +
+			facet_wrap(~panel, nrow=1) +
+			labs(x="Expected cis-h2 (held-out individuals)", y="Held-out Var(y)") +
+			figure_theme()
+		save_plot(plot_grid(pp_a, pp_b, ncol=1), "heritability_calibration_variance_scale", gene_set_suffix, panel_width, 6.5)
+	}
+
+	# 7c. Expected cis-h2 with the correlations between variants set to 0 (sum of squared effects): (a) against held-out HE times var_y; (b) against the
+	# usual expected cis-h2, Var(X beta), where points above y = x mean that LD between a sample's effects lowers Var(X beta) and below that it raises it
+	if ("expected_cis_h2_independent" %in% colnames(df) & "cis_snp_h2_he_var_test" %in% colnames(df)) {
+		summary_df <- binned_calibration_df(df, "expected_cis_h2_independent", "cis_snp_h2_he_var_test")
+		pp_a <- calibration_plot(summary_df, "Expected cis-h2, independent variants", "Held-out HE cis-h2 x Var(y)") + ggtitle(paste0(tissue, ", ", gene_set_label))
+		summary_df <- binned_calibration_df(df, "expected_cis_h2", "expected_cis_h2_independent")
+		pp_b <- calibration_plot(summary_df, "Expected cis-h2, Var(X beta)", "Expected cis-h2, independent variants")
+		save_plot(plot_grid(pp_a, pp_b, ncol=1), "heritability_calibration_independent_snps", gene_set_suffix, panel_width, 6.5)
+	}
+
+	# 7d. What the model predicts held-out HE to be, given how HE weights LD: (a) observed against predicted held-out HE times var_y; (b) predicted HE
+	# against expected cis-h2, which is how far HE sits from Var(X beta) under the model's effects
+	if ("expected_cis_snp_h2_he_var_test" %in% colnames(df)) {
+		summary_df <- binned_calibration_df(df, "expected_cis_snp_h2_he_var_test", "cis_snp_h2_he_var_test")
+		pp_a <- calibration_plot(summary_df, "Model-predicted held-out HE cis-h2 x Var(y)", "Held-out HE cis-h2 x Var(y)") + ggtitle(paste0(tissue, ", ", gene_set_label))
+		summary_df <- binned_calibration_df(df, "expected_cis_h2", "expected_cis_snp_h2_he_var_test")
+		pp_b <- calibration_plot(summary_df, "Expected cis-h2, Var(X beta)", "Model-predicted held-out HE cis-h2 x Var(y)")
+		save_plot(plot_grid(pp_a, pp_b, ncol=1), "heritability_calibration_predicted_he", gene_set_suffix, panel_width, 6.5)
+	}
 }
 
 gene_sets <- list(
@@ -416,6 +515,99 @@ gene_sets <- list(
 for (gene_set in gene_sets) {
 	print(paste0(gene_set$label, ": ", nrow(gene_set$df), " gene-fold rows"))
 	make_gene_level_plots(gene_set$df, gene_set$suffix, gene_set$label)
+}
+
+
+#####################
+# 3e. Expression FSR calibration within strata of the genes (all genes). Every stratifier is a training-fold quantity, so calibration should hold
+# within each stratum if the model is right. Where the excess of observed r < 0 sits says where the over-confidence comes from:
+#   training LRT p-value (model-free evidence of cis heritability): an excess in the weak-evidence strata points to a shared prior that is too
+#       generous to genes with little or no cis signal
+#   number of cis variants: the prior's expected number of eQTLs is proportional to it (README.md, section 5f)
+#   Monte Carlo fraction y_hat_mc_variance / V (evaluations with that column): an excess where it is large points to the Monte Carlo error that
+#       y_hat shares with the predictive draws (section 7)
+# Pdfs <tissue>_expression_fsr_calibration_by_<stratifier>_all_genes.pdf (equal-count deciles of the FSR within each stratum), and
+# <tissue>_expression_fsr_mid_range_by_stratum_all_genes.txt: genes with expression FSR in (mid_range_fsr[1], mid_range_fsr[2]], per stratum
+# and panel: number of gene-fold rows, mean FSR (expected), fraction with observed r < 0 (observed) and its clustered standard error
+#####################
+mid_range_fsr <- c(0.1, 0.4)
+
+quantile_strata <- function(x, n, label) {
+	breaks <- unique(quantile(x, probs=seq(0, 1, length.out=n + 1), na.rm=TRUE))
+	labels <- paste0(label, " ", signif(breaks[-length(breaks)], 2), " to ", signif(breaks[-1], 2))
+	return(cut(x, breaks=breaks, labels=labels, include.lowest=TRUE))
+}
+
+stratifiers <- list(
+	list(name="training_pvalue", label="training LRT p-value",
+	     strata=cut(gene_fold_df$cis_snp_h2_pvalue_train, breaks=c(-Inf, 0.001, 0.05, 0.5, Inf), right=FALSE,
+	                labels=c("LRT p < 0.001", "LRT p 0.001 to 0.05", "LRT p 0.05 to 0.5", "LRT p >= 0.5"))),
+	list(name="n_cis_variants", label="number of cis variants", strata=quantile_strata(gene_fold_df$n_cis_variants, 3, "cis variants")))
+if ("y_hat_mc_variance" %in% colnames(gene_fold_df)) {
+	stratifiers[[length(stratifiers) + 1]] <- list(name="mc_fraction", label="Monte Carlo fraction of V",
+		strata=quantile_strata(gene_fold_df$y_hat_mc_variance / gene_fold_df$predicted_expression_variance, 4, "MC fraction"))
+}
+
+mid_range_rows <- list()
+for (stratifier in stratifiers) {
+	df <- gene_fold_df
+	df$stratum <- stratifier$strata
+	df$false_sign <- as.numeric(df$observed_r < 0)
+	df <- with_pooled_panel(df[!is.na(df$stratum), ])
+	summary_rows <- list()
+	for (stratum in levels(df$stratum)) {
+		stratum_df <- df[df$stratum == stratum, ]
+		summary_df <- binned_calibration_df(stratum_df, "expression_FSR", "false_sign")
+		if (!is.null(summary_df)) {
+			summary_rows[[length(summary_rows) + 1]] <- cbind(summary_df, stratum=stratum)
+		}
+		for (panel in fold_levels) {
+			mid_df <- stratum_df[stratum_df$panel == panel & !is.na(stratum_df$expression_FSR) & !is.na(stratum_df$observed_r) &
+			                     stratum_df$expression_FSR > mid_range_fsr[1] & stratum_df$expression_FSR <= mid_range_fsr[2], ]
+			if (nrow(mid_df) == 0) {
+				next
+			}
+			mid_range_rows[[length(mid_range_rows) + 1]] <- data.frame(stratifier=stratifier$name, stratum=stratum, panel=panel, n=nrow(mid_df),
+				expected=mean(mid_df$expression_FSR), observed=mean(mid_df$false_sign), observed_se=cluster_se_of_mean(mid_df$false_sign, mid_df$gene_id))
+		}
+	}
+	if (length(summary_rows) == 0) {
+		next
+	}
+	summary_df <- do.call(rbind, summary_rows)
+	summary_df$stratum <- factor(summary_df$stratum, levels=levels(df$stratum))
+	pp <- calibration_plot(summary_df, "Expected expression FSR (decile mean)", "Fraction of genes with observed r < 0", row_var="stratum") +
+		ggtitle(paste0(tissue, ", all genes, by ", stratifier$label))
+	save_plot(pp, paste0("expression_fsr_calibration_by_", stratifier$name), "_all_genes", 2.6 * length(fold_levels), 2.4 * length(levels(summary_df$stratum)) + 1)
+}
+if (length(mid_range_rows) > 0) {
+	mid_range_df <- do.call(rbind, mid_range_rows)
+	write.table(mid_range_df, paste0(viz_dir, tissue, "_expression_fsr_mid_range_by_stratum_all_genes.txt"), sep="\t", quote=FALSE, row.names=FALSE)
+	print(mid_range_df[mid_range_df$panel == "Pooled", ])
+}
+
+
+#####################
+# 8. Distribution of the genetic FSR in fold 1: (a) all genes, (b) heritable genes (training LRT p < heritability_pvalue_threshold), stacked
+# on the same x axis (<tissue>_genetic_fsr_histogram_fold_1.pdf). Genes with constant held-out predictions (genetic FSR NA) are left out.
+#####################
+fold_1_df <- gene_fold_df[gene_fold_df$fold == 1 & !is.na(gene_fold_df$genetic_FSR), ]
+if (nrow(fold_1_df) > 0) {
+	heritable <- !is.na(fold_1_df$cis_snp_h2_pvalue_train) & fold_1_df$cis_snp_h2_pvalue_train < heritability_pvalue_threshold
+	panel_levels <- c(paste0("a. All genes (n = ", nrow(fold_1_df), ")"),
+	                  paste0("b. Heritable genes, training LRT p < ", heritability_pvalue_threshold, " (n = ", sum(heritable), ")"))
+	hist_df <- rbind(
+		data.frame(genetic_FSR=fold_1_df$genetic_FSR, gene_set=panel_levels[1]),
+		data.frame(genetic_FSR=fold_1_df$genetic_FSR[heritable], gene_set=panel_levels[2]))
+	hist_df$gene_set <- factor(hist_df$gene_set, levels=panel_levels)
+	pp <- ggplot(hist_df, aes(x=genetic_FSR)) +
+		geom_histogram(binwidth=0.01, boundary=0, fill=fold_colors[["Fold 1"]], color=NA) +
+		facet_wrap(~gene_set, ncol=1, scales="free_y") +
+		labs(x="Genetic FSR", y="Genes") +
+		ggtitle(paste0(tissue, ", fold 1")) +
+		figure_theme() +
+		theme(strip.text=element_text(hjust=0))
+	ggsave(paste0(viz_dir, tissue, "_genetic_fsr_histogram_fold_1.pdf"), pp, width=6, height=6, units="in")
 }
 
 
