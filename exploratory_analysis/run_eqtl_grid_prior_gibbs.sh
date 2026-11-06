@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -c 1                               # Request one core (genes run in parallel through numba prange if given more)
-#SBATCH -t 2-30:00                        # Runtime in D-HH:MM format
+#SBATCH -t 4-30:00                        # Runtime in D-HH:MM format
 #SBATCH -p bch-compute                           # Partition to run in
 #SBATCH --mem=40G                        # Memory total in MiB (for all cores): int8 training genotypes and the sparse effect samples are held in memory
 

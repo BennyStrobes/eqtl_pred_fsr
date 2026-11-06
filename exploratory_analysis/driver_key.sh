@@ -113,7 +113,6 @@ done
 fi
 
 
-
 #####################
 # 3. Evaluate predictions of every model in each held-out fold (after the fits of step 2 have finished), with y_hat and the expected quantities from
 # separate blocks of retained samples (README.md, section 7)
