@@ -132,9 +132,11 @@ fi
 #####################
 if false; then
 for model_label in ${model_labels}; do
-	sh organize_and_visualize_cross_validation_results.sh ${tissue}${model_label} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir} _split_samples
+	sbatch organize_and_visualize_cross_validation_results.sh ${tissue}${model_label} ${n_folds} ${gibbs_results_dir} ${held_out_evaluation_dir} ${visualization_dir} _split_samples
 done
 fi
+
+
 
 
 #####################

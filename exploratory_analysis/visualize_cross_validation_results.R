@@ -1,671 +1,734 @@
 args = commandArgs(trailingOnly=TRUE)
 library(cowplot)
 library(ggplot2)
+library(RColorBrewer)
+library(scales)
 options(warn=1)
 
-# Plots of the cross-validated eQTL prior fits of one tissue (README.md, section 8), from organize_cross_validation_results.py
+# Plots of the cross-validated eQTL prior fits of one tissue, from organize_cross_validation_results.py
 #   args[1]: organized results stem (the --output_stem of the organizer); args[2]: output directory for the pdfs; args[3]: tissue
-# Every gene-level plot has one panel per fold and a "Pooled" panel (all gene-fold rows; standard errors clustered by gene, since a gene's
-# rows in different folds share training individuals). Each is made for all genes (<tissue>_<plot>_all_genes.pdf) and for heritable genes
-# (training-fold cis-h2 LRT p < heritability_pvalue_threshold, selected on training data only; <tissue>_<plot>_heritable_genes.pdf).
-organized_stem <- args[1]
-viz_dir <- args[2]
-tissue <- args[3]
-dir.create(viz_dir, showWarnings=FALSE, recursive=TRUE)
-
-# Number of equal-count bins of the expected quantities (per panel)
-n_bins <- 10
-# Expression-FSR bins (as in gdl_uncertainty_paper)
-fsr_bin_breaks <- c(0, 0.1, 0.2, 0.3, 0.4, Inf)
-fsr_bin_labels <- c("[0,0.1]", "(0.1,0.2]", "(0.2,0.3]", "(0.3,0.4]", ">0.4")
-# FSR thresholds: genes called at FSR <= threshold
-fsr_thresholds <- c(0.001, 0.01, 0.05, 0.1, 0.2, 0.3)
-# Nominal levels of the posterior predictive intervals of the observed correlation
-coverage_levels <- c(80, 90, 95, 99)
-# Heritable genes: training-fold cis-h2 LRT p-value below this threshold
-heritability_pvalue_threshold <- 0.05
-# Smallest N shown in the top-N-genes plot
-top_n_min_genes <- 10
+# The earlier exploratory plots are kept in visualize_cross_validation_results_exploratory.R
 
 figure_theme <- function() {
-	return(
-		theme_minimal(base_size=11) +
-		theme(
-			plot.title=element_text(face="bold", size=12, hjust=.5),
-			axis.title=element_text(size=11, color="#25313B"),
-			axis.text=element_text(size=10, color="#33424F"),
-			strip.text=element_text(size=10, face="bold"),
-			panel.grid.minor=element_blank(),
-			axis.line.x=element_line(colour="#7E8A97", linewidth=.35),
-			axis.line.y=element_line(colour="#7E8A97", linewidth=.35),
-			legend.position="bottom",
-			legend.title=element_blank()
-		)
-	)
+	return(theme(plot.title = element_text(face="plain",size=11), text = element_text(size=11),axis.text=element_text(size=11), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.background = element_blank(), axis.line = element_line(colour = "black"), legend.text = element_text(size=11), legend.title = element_text(size=11)))
 }
 
-gene_fold_df <- read.table(paste0(organized_stem, "_per_gene_fold.txt"), header=TRUE, sep="\t", stringsAsFactors=FALSE, na.strings=c("NA", "nan", "NaN"))
-trace_df <- read.table(paste0(organized_stem, "_hyperparameter_trace.txt"), header=TRUE, sep="\t", stringsAsFactors=FALSE)
-
-folds <- sort(unique(gene_fold_df$fold))
-fold_levels <- c(paste0("Fold ", folds), "Pooled")
-fold_colors <- setNames(c(hcl.colors(length(folds), "Dark 3"), "#3E4A56"), fold_levels)
 
 
-#####################
-# Helpers
-#####################
-with_pooled_panel <- function(df) {
-	# Each row once in its fold's panel and once in the pooled panel
-	per_fold <- df
-	per_fold$panel <- paste0("Fold ", df$fold)
-	pooled <- df
-	pooled$panel <- "Pooled"
-	out <- rbind(per_fold, pooled)
-	out$panel <- factor(out$panel, levels=fold_levels)
-	return(out)
-}
 
-cluster_cov_of_means <- function(a, b, cluster) {
-	# Covariance of the means of a and b, clustered by gene: sum over genes of (sum of the gene's a deviations)(sum of its b deviations) / n^2.
-	# With one row per gene this is the usual covariance / n (1/n convention).
-	n <- length(a)
-	sum_a <- tapply(a - mean(a), cluster, sum)
-	sum_b <- tapply(b - mean(b), cluster, sum)
-	return(sum(sum_a * sum_b) / n^2)
-}
+compute_decile_summary_df <- function(df, x_col, y_col, n_bins) {
+	# Split genes into n_bins equal-count bins (deciles when n_bins=10) by x_col (the expected quantity). Each row gives the bin's mean x and
+	# the mean of y_col (the observed quantity) with a 95% CI (mean +/- 1.96 * empirical SE across genes in the bin).
+	df = df[!is.na(df[[x_col]]) & !is.na(df[[y_col]]), ]
+	bin_id = ceiling(rank(df[[x_col]], ties.method="first") / nrow(df) * n_bins)
 
-cluster_se_of_mean <- function(x, cluster) {
-	return(sqrt(cluster_cov_of_means(x, x, cluster)))
-}
+	bin_arr = c()
+	n_gene_arr = c()
+	mean_x_arr = c()
+	mean_y_arr = c()
+	mean_y_lb_arr = c()
+	mean_y_ub_arr = c()
+	for (bin_iter in 1:n_bins) {
+		bin_df = df[bin_id == bin_iter, ]
+		mean_y = mean(bin_df[[y_col]])
+		se_y = sd(bin_df[[y_col]]) / sqrt(nrow(bin_df))
 
-equal_count_bins <- function(x, n_bins) {
-	return(ceiling(n_bins * rank(x, ties.method="first") / length(x)))
-}
-
-binned_calibration_df <- function(df, x_col, y_col) {
-	# One row per panel and equal-count bin of x_col: mean x and mean y with clustered standard errors
-	rows <- list()
-	for (panel in levels(df$panel)) {
-		sub_df <- df[df$panel == panel & !is.na(df[[x_col]]) & !is.na(df[[y_col]]), ]
-		if (nrow(sub_df) < n_bins) {
-			next
-		}
-		bins <- equal_count_bins(sub_df[[x_col]], n_bins)
-		for (bin in 1:n_bins) {
-			bin_df <- sub_df[bins == bin, ]
-			rows[[length(rows) + 1]] <- data.frame(panel=panel, bin=bin, n=nrow(bin_df),
-				x=mean(bin_df[[x_col]]), x_se=cluster_se_of_mean(bin_df[[x_col]], bin_df$gene_id),
-				y=mean(bin_df[[y_col]]), y_se=cluster_se_of_mean(bin_df[[y_col]], bin_df$gene_id))
-		}
+		bin_arr = c(bin_arr, bin_iter)
+		n_gene_arr = c(n_gene_arr, nrow(bin_df))
+		mean_x_arr = c(mean_x_arr, mean(bin_df[[x_col]]))
+		mean_y_arr = c(mean_y_arr, mean_y)
+		mean_y_lb_arr = c(mean_y_lb_arr, mean_y - 1.96*se_y)
+		mean_y_ub_arr = c(mean_y_ub_arr, mean_y + 1.96*se_y)
 	}
-	if (length(rows) == 0) {
-		return(NULL)
-	}
-	out <- do.call(rbind, rows)
-	out$panel <- factor(out$panel, levels=fold_levels)
-	return(out)
+
+	summary_df = data.frame(bin=bin_arr, n_genes=n_gene_arr, mean_x=mean_x_arr, mean_y=mean_y_arr, mean_y_lb=mean_y_lb_arr, mean_y_ub=mean_y_ub_arr)
+	return(summary_df)
 }
 
-genetic_calibration_df <- function(df) {
-	# As gdl Plot 2: per equal-count bin of expected_genetic_r, y = mean(observed_r) / sqrt(mean(cis_snp_h2_he_test)), with a delta-method
-	# standard error for g(a, c) = a / sqrt(c) from the clustered (co)variances of the two bin means. Bins with mean h2 <= 0 get no point.
-	rows <- list()
-	for (panel in levels(df$panel)) {
-		sub_df <- df[df$panel == panel & !is.na(df$expected_genetic_r) & !is.na(df$observed_r) & !is.na(df$cis_snp_h2_he_test), ]
-		if (nrow(sub_df) < n_bins) {
-			next
-		}
-		bins <- equal_count_bins(sub_df$expected_genetic_r, n_bins)
-		for (bin in 1:n_bins) {
-			bin_df <- sub_df[bins == bin, ]
-			a <- mean(bin_df$observed_r)
-			c <- mean(bin_df$cis_snp_h2_he_test)
-			if (c <= 0) {
-				next
-			}
-			var_a <- cluster_cov_of_means(bin_df$observed_r, bin_df$observed_r, bin_df$gene_id)
-			var_c <- cluster_cov_of_means(bin_df$cis_snp_h2_he_test, bin_df$cis_snp_h2_he_test, bin_df$gene_id)
-			cov_ac <- cluster_cov_of_means(bin_df$observed_r, bin_df$cis_snp_h2_he_test, bin_df$gene_id)
-			var_y <- var_a / c - a * cov_ac / c^2 + a^2 * var_c / (4 * c^3)
-			rows[[length(rows) + 1]] <- data.frame(panel=panel, bin=bin, n=nrow(bin_df),
-				x=mean(bin_df$expected_genetic_r), x_se=cluster_se_of_mean(bin_df$expected_genetic_r, bin_df$gene_id),
-				y=a / sqrt(c), y_se=sqrt(max(var_y, 0)))
-		}
+
+compute_decile_summary_df_by_fold <- function(df, x_col, y_col, n_bins, folds) {
+	# compute_decile_summary_df within each fold (deciles are formed within the fold), stacked, with a "Fold <k>" label column
+	summary_df_list = list()
+	for (fold in folds) {
+		fold_summary_df = compute_decile_summary_df(df[df$fold == fold, ], x_col, y_col, n_bins)
+		fold_summary_df$fold = paste0("Fold ", fold)
+		summary_df_list[[length(summary_df_list) + 1]] = fold_summary_df
 	}
-	if (length(rows) == 0) {
-		return(NULL)
-	}
-	out <- do.call(rbind, rows)
-	out$panel <- factor(out$panel, levels=fold_levels)
-	return(out)
+	summary_df = do.call(rbind, summary_df_list)
+	summary_df$fold = factor(summary_df$fold, levels=paste0("Fold ", folds))
+	return(summary_df)
 }
 
-mean_over_sqrt_mean <- function(numerator, denominator, cluster) {
-	# mean(numerator) / sqrt(mean(denominator)) with a delta-method standard error, as in genetic_calibration_df. NULL if mean(denominator) <= 0
-	a <- mean(numerator)
-	c <- mean(denominator)
-	if (c <= 0) {
-		return(NULL)
-	}
-	var_a <- cluster_cov_of_means(numerator, numerator, cluster)
-	var_c <- cluster_cov_of_means(denominator, denominator, cluster)
-	cov_ac <- cluster_cov_of_means(numerator, denominator, cluster)
-	var_ratio <- var_a / c - a * cov_ac / c^2 + a^2 * var_c / (4 * c^3)
-	return(list(value=a / sqrt(c), se=sqrt(max(var_ratio, 0))))
-}
 
-genetic_calibration_ld_corrected_df <- function(df) {
-	# genetic_calibration_df with HE corrected for the way it weights LD. r(y_hat, y) is about r(y_hat, u) sqrt(h2), so y = mean(observed_r) / sqrt(h2) estimates
-	# the genetic correlation, but HE over-counts eQTLs in high LD (README.md, section 8, plot 7e), so sqrt(mean(cis_snp_h2_he_test)) is too large. Per bin,
-	# h2 = mean(cis_snp_h2_he_test) x mean(expected_cis_h2) / mean(expected_cis_snp_h2_he_var_test). The ratio is Var(u) over the HE slope of the model's
-	# effects, u' W u. It does not change if every effect is rescaled, so the model sets only the LD correction and the size of h2 comes from the held-out
-	# expression. It is computed from bin means (a ratio per gene is unstable for weak genes) and treated as fixed in the standard error
-	rows <- list()
-	for (panel in levels(df$panel)) {
-		sub_df <- df[df$panel == panel & !is.na(df$expected_genetic_r) & !is.na(df$observed_r) & !is.na(df$cis_snp_h2_he_test) & !is.na(df$expected_cis_h2) &
-		             !is.na(df$expected_cis_snp_h2_he_var_test), ]
-		if (nrow(sub_df) < n_bins) {
-			next
-		}
-		bins <- equal_count_bins(sub_df$expected_genetic_r, n_bins)
-		for (bin in 1:n_bins) {
-			bin_df <- sub_df[bins == bin, ]
-			predicted_he <- mean(bin_df$expected_cis_snp_h2_he_var_test)
+compute_genetic_correlation_decile_summary_df <- function(df, n_bins, h2_source="ld_corrected_he") {
+	# Split genes into n_bins equal-count bins by expected_genetic_r (expected correlation of the prediction with genetic expression). In each
+	# bin, observed r is about r(y_hat, u) sqrt(h2), so y = mean(observed_r) / sqrt(h2) estimates the genetic correlation. h2 is set by h2_source:
+	#   "ld_corrected_he": held-out HE corrected for the way HE weights LD: mean(cis_snp_h2_he_test) x mean(expected_cis_h2) /
+	#       mean(expected_cis_snp_h2_he_var_test). That ratio is computed from bin means and treated as fixed
+	#   "model": the model's own expected cis-h2, mean(expected_cis_h2) (Var(X beta) in the held-out individuals). y / x is then about observed r
+	#       over the model's expected r, so this cannot separate an error in the genetic correlation from one in h2
+	# The 95% CI of y is from a delta-method SE for a / sqrt(c), with a and c the bin means of observed_r and of the per-gene h2. Bins whose
+	# predicted HE or h2 is <= 0 get no point.
+	if (h2_source == "ld_corrected_he") {
+		df = df[!is.na(df$expected_genetic_r) & !is.na(df$observed_r) & !is.na(df$cis_snp_h2_he_test) & !is.na(df$expected_cis_h2) & !is.na(df$expected_cis_snp_h2_he_var_test), ]
+	} else {
+		df = df[!is.na(df$expected_genetic_r) & !is.na(df$observed_r) & !is.na(df$expected_cis_h2), ]
+	}
+	bin_id = ceiling(rank(df$expected_genetic_r, ties.method="first") / nrow(df) * n_bins)
+
+	bin_arr = c()
+	n_gene_arr = c()
+	mean_x_arr = c()
+	mean_y_arr = c()
+	mean_y_lb_arr = c()
+	mean_y_ub_arr = c()
+	for (bin_iter in 1:n_bins) {
+		bin_df = df[bin_id == bin_iter, ]
+		n_genes = nrow(bin_df)
+		if (h2_source == "ld_corrected_he") {
+			predicted_he = mean(bin_df$expected_cis_snp_h2_he_var_test)
 			if (predicted_he <= 0) {
 				next
 			}
-			corrected <- mean_over_sqrt_mean(bin_df$observed_r, bin_df$cis_snp_h2_he_test * mean(bin_df$expected_cis_h2) / predicted_he, bin_df$gene_id)
-			if (is.null(corrected)) {
-				next
-			}
-			rows[[length(rows) + 1]] <- data.frame(panel=panel, bin=bin, n=nrow(bin_df),
-				x=mean(bin_df$expected_genetic_r), x_se=cluster_se_of_mean(bin_df$expected_genetic_r, bin_df$gene_id),
-				y=corrected$value, y_se=corrected$se)
+			h2 = bin_df$cis_snp_h2_he_test * mean(bin_df$expected_cis_h2) / predicted_he
+		} else {
+			h2 = bin_df$expected_cis_h2
 		}
+		a = mean(bin_df$observed_r)
+		c = mean(h2)
+		if (c <= 0) {
+			next
+		}
+		var_a = var(bin_df$observed_r) / n_genes
+		var_c = var(h2) / n_genes
+		cov_ac = cov(bin_df$observed_r, h2) / n_genes
+		var_y = var_a / c - a * cov_ac / c^2 + a^2 * var_c / (4 * c^3)
+		mean_y = a / sqrt(c)
+		se_y = sqrt(max(var_y, 0))
+
+		bin_arr = c(bin_arr, bin_iter)
+		n_gene_arr = c(n_gene_arr, n_genes)
+		mean_x_arr = c(mean_x_arr, mean(bin_df$expected_genetic_r))
+		mean_y_arr = c(mean_y_arr, mean_y)
+		mean_y_lb_arr = c(mean_y_lb_arr, mean_y - 1.96*se_y)
+		mean_y_ub_arr = c(mean_y_ub_arr, mean_y + 1.96*se_y)
 	}
-	if (length(rows) == 0) {
-		return(NULL)
-	}
-	out <- do.call(rbind, rows)
-	out$panel <- factor(out$panel, levels=fold_levels)
-	return(out)
+
+	summary_df = data.frame(bin=bin_arr, n_genes=n_gene_arr, mean_x=mean_x_arr, mean_y=mean_y_arr, mean_y_lb=mean_y_lb_arr, mean_y_ub=mean_y_ub_arr)
+	return(summary_df)
 }
 
-fsr_calibration_df <- function(df, fsr_col) {
-	# One row per panel and FSR bin: mean FSR (expected) and fraction of genes with a negative observed correlation (observed)
-	rows <- list()
-	for (panel in levels(df$panel)) {
-		sub_df <- df[df$panel == panel & !is.na(df[[fsr_col]]) & !is.na(df$observed_r), ]
-		bins <- cut(sub_df[[fsr_col]], breaks=fsr_bin_breaks, labels=fsr_bin_labels, include.lowest=TRUE, right=TRUE)
-		for (bin in fsr_bin_labels) {
-			bin_df <- sub_df[!is.na(bins) & bins == bin, ]
-			if (nrow(bin_df) == 0) {
-				next
-			}
-			false_sign <- as.numeric(bin_df$observed_r < 0)
-			rows[[length(rows) + 1]] <- data.frame(panel=panel, bin=bin, n=nrow(bin_df),
-				x=mean(bin_df[[fsr_col]]), x_se=cluster_se_of_mean(bin_df[[fsr_col]], bin_df$gene_id),
-				y=mean(false_sign), y_se=cluster_se_of_mean(false_sign, bin_df$gene_id))
-		}
+
+compute_genetic_correlation_decile_summary_df_by_fold <- function(df, n_bins, folds, h2_source="ld_corrected_he") {
+	# compute_genetic_correlation_decile_summary_df within each fold, stacked, with a "Fold <k>" label column
+	summary_df_list = list()
+	for (fold in folds) {
+		fold_summary_df = compute_genetic_correlation_decile_summary_df(df[df$fold == fold, ], n_bins, h2_source)
+		fold_summary_df$fold = paste0("Fold ", fold)
+		summary_df_list[[length(summary_df_list) + 1]] = fold_summary_df
 	}
-	if (length(rows) == 0) {
-		return(NULL)
-	}
-	out <- do.call(rbind, rows)
-	out$panel <- factor(out$panel, levels=fold_levels)
-	return(out)
+	summary_df = do.call(rbind, summary_df_list)
+	summary_df$fold = factor(summary_df$fold, levels=paste0("Fold ", folds))
+	return(summary_df)
 }
 
-fsr_threshold_df <- function(df, fsr_col) {
-	# One row per panel and FSR threshold, over the genes with FSR <= threshold: fraction with a negative observed correlation (observed) and
-	# mean FSR (expected)
-	rows <- list()
-	for (panel in levels(df$panel)) {
-		sub_df <- df[df$panel == panel & !is.na(df[[fsr_col]]) & !is.na(df$observed_r), ]
-		for (threshold in fsr_thresholds) {
-			called_df <- sub_df[sub_df[[fsr_col]] <= threshold, ]
-			if (nrow(called_df) == 0) {
-				next
-			}
-			false_sign <- as.numeric(called_df$observed_r < 0)
-			rows[[length(rows) + 1]] <- data.frame(panel=panel, threshold=threshold, n=nrow(called_df),
-				observed=mean(false_sign), observed_se=cluster_se_of_mean(false_sign, called_df$gene_id), expected=mean(called_df[[fsr_col]]))
-		}
+
+compute_coverage_summary_df <- function(df, coverage_levels) {
+	# For each nominal level L (in %), the fraction of genes whose observed held-out correlation lies inside their L% posterior predictive interval
+	# (expected_r_lb_L, expected_r_ub_L: quantiles over posterior samples of corr(y_hat, u + eps)), with a 95% binomial (normal approximation) CI.
+	# Same columns as compute_decile_summary_df (mean_x is the nominal level as a fraction), so make_calibration_plot draws it.
+	df = df[!is.na(df$observed_r), ]
+
+	level_arr = c()
+	n_gene_arr = c()
+	coverage_arr = c()
+	coverage_lb_arr = c()
+	coverage_ub_arr = c()
+	for (level in coverage_levels) {
+		lb = df[[paste0("expected_r_lb_", level)]]
+		ub = df[[paste0("expected_r_ub_", level)]]
+		keep = !is.na(lb) & !is.na(ub)
+		covered = (df$observed_r[keep] >= lb[keep]) & (df$observed_r[keep] <= ub[keep])
+		coverage = mean(covered)
+		coverage_se = sqrt(coverage*(1.0 - coverage) / sum(keep))
+
+		level_arr = c(level_arr, level / 100)
+		n_gene_arr = c(n_gene_arr, sum(keep))
+		coverage_arr = c(coverage_arr, coverage)
+		coverage_lb_arr = c(coverage_lb_arr, coverage - 1.96*coverage_se)
+		coverage_ub_arr = c(coverage_ub_arr, coverage + 1.96*coverage_se)
 	}
-	if (length(rows) == 0) {
-		return(NULL)
-	}
-	out <- do.call(rbind, rows)
-	out$panel <- factor(out$panel, levels=fold_levels)
-	return(out)
+
+	summary_df = data.frame(n_genes=n_gene_arr, mean_x=level_arr, mean_y=coverage_arr, mean_y_lb=coverage_lb_arr, mean_y_ub=coverage_ub_arr)
+	return(summary_df)
 }
 
-calibration_plot <- function(summary_df, xlab, ylab, row_var=NULL) {
-	# Observed against expected per bin (95% intervals in both directions), dashed y = x, one panel per fold (and per row_var, if given)
-	pp <- ggplot(summary_df, aes(x=x, y=y, color=panel)) +
-		geom_abline(slope=1, intercept=0, linetype="dashed", color="#7E8A97") +
-		geom_errorbar(aes(ymin=y - 1.96 * y_se, ymax=y + 1.96 * y_se), width=0) +
-		geom_errorbarh(aes(xmin=x - 1.96 * x_se, xmax=x + 1.96 * x_se), height=0) +
-		geom_line(linewidth=.35) +
-		geom_point(size=1.6) +
-		scale_color_manual(values=fold_colors, guide="none") +
-		labs(x=xlab, y=ylab) +
-		figure_theme()
-	if (is.null(row_var)) {
-		pp <- pp + facet_wrap(~panel, nrow=1)
+
+compute_coverage_summary_df_by_fold <- function(df, coverage_levels, folds) {
+	# compute_coverage_summary_df within each fold, stacked, with a "Fold <k>" label column
+	summary_df_list = list()
+	for (fold in folds) {
+		fold_summary_df = compute_coverage_summary_df(df[df$fold == fold, ], coverage_levels)
+		fold_summary_df$fold = paste0("Fold ", fold)
+		summary_df_list[[length(summary_df_list) + 1]] = fold_summary_df
+	}
+	summary_df = do.call(rbind, summary_df_list)
+	summary_df$fold = factor(summary_df$fold, levels=paste0("Fold ", folds))
+	return(summary_df)
+}
+
+
+make_calibration_plot <- function(summary_df, xlab, ylab, point_color=single_color) {
+	# Calibration plot: mean observed (points with 95% CI, joined by a line) against mean expected in each decile of the expected quantity.
+	# The dashed line is y = x. If summary_df has a fold column, one panel per fold, colored by fold (fold_colors); otherwise everything is
+	# drawn in point_color.
+	reference_color = "#3F3F46"
+
+	if ("fold" %in% colnames(summary_df)) {
+		pp = ggplot(summary_df, aes(x=mean_x, y=mean_y, color=fold)) +
+			geom_abline(slope=1, intercept=0, color=reference_color, linetype="dashed", linewidth=0.6) +
+			geom_line(linewidth=0.7) +
+			geom_pointrange(aes(ymin=mean_y_lb, ymax=mean_y_ub), linewidth=0.7) +
+			geom_point(size=2.4) +
+			scale_color_manual(values=fold_colors, guide="none") +
+			facet_wrap(~fold, nrow=1) +
+			figure_theme() +
+			theme(strip.background=element_blank(), strip.text=element_text(size=11), panel.spacing=unit(1.2, "lines")) +
+			labs(x=xlab, y=ylab)
 	} else {
-		pp <- pp + facet_grid(as.formula(paste0(row_var, " ~ panel")), scales="free")
+		pp = ggplot(summary_df, aes(x=mean_x, y=mean_y)) +
+			geom_abline(slope=1, intercept=0, color=reference_color, linetype="dashed", linewidth=0.6) +
+			geom_line(color=point_color, linewidth=0.7) +
+			geom_pointrange(aes(ymin=mean_y_lb, ymax=mean_y_ub), color=point_color, linewidth=0.7) +
+			geom_point(color=point_color, size=2.4) +
+			figure_theme() +
+			labs(x=xlab, y=ylab)
 	}
 	return(pp)
 }
 
-save_plot <- function(pp, plot_name, gene_set_suffix, width, height) {
-	ggsave(paste0(viz_dir, tissue, "_", plot_name, gene_set_suffix, ".pdf"), pp, width=width, height=height, units="in", limitsize=FALSE)
-}
 
+compute_fsr_threshold_summary_df <- function(df, fsr_col, fsr_thresholds) {
+	# For each FSR threshold, the genes called (FSR <= threshold): their number, the fraction with a negative held-out correlation (observed)
+	# with a 95% binomial (normal approximation) CI, and their mean FSR (expected fraction with the wrong sign).
+	df = df[!is.na(df[[fsr_col]]) & !is.na(df$false_sign), ]
 
-#####################
-# Gene-level plots (plots 1 to 5 and 7 of README.md, section 8)
-#####################
-make_gene_level_plots <- function(df, gene_set_suffix, gene_set_label) {
-	df <- with_pooled_panel(df)
-	n_panels <- length(fold_levels)
-	panel_width <- 2.6 * n_panels
-
-	# 1. Correlation calibration: observed correlation against the posterior predictive expected correlation and the plug-in sqrt(V)
-	summary_df <- rbind(
-		cbind(binned_calibration_df(df, "expected_r", "observed_r"), predictor="Posterior predictive"),
-		cbind(binned_calibration_df(df, "expected_r_plugin", "observed_r"), predictor="Plug-in sqrt(V)"))
-	summary_df$predictor <- factor(summary_df$predictor, levels=c("Posterior predictive", "Plug-in sqrt(V)"))
-	pp <- calibration_plot(summary_df, "Expected correlation", "Observed held-out correlation", row_var="predictor") + ggtitle(paste0(tissue, ", ", gene_set_label))
-	save_plot(pp, "correlation_calibration", gene_set_suffix, panel_width, 6)
-
-	# 2. Genetic-scale calibration
-	summary_df <- genetic_calibration_df(df)
-	if (!is.null(summary_df)) {
-		pp <- calibration_plot(summary_df, "Expected correlation with genetic expression", "Mean observed r / sqrt(mean held-out HE h2)") + ggtitle(paste0(tissue, ", ", gene_set_label))
-		save_plot(pp, "genetic_correlation_calibration", gene_set_suffix, panel_width, 3.4)
-	}
-	# The same with HE corrected for the way it weights LD (see genetic_calibration_ld_corrected_df). Evaluations made before these columns were added have no such plot
-	if ("expected_cis_snp_h2_he_var_test" %in% colnames(df)) {
-		summary_df <- genetic_calibration_ld_corrected_df(df)
-		if (!is.null(summary_df)) {
-			pp <- calibration_plot(summary_df, "Expected correlation with genetic expression", "Mean observed r / sqrt(LD-corrected held-out HE h2)") +
-				ggtitle(paste0(tissue, ", ", gene_set_label))
-			save_plot(pp, "genetic_correlation_calibration_ld_corrected", gene_set_suffix, panel_width, 3.4)
-		}
-	}
-
-	# 3. FSR calibration: fraction of genes with a negative observed correlation against the expression FSR (the calibration target) and the genetic FSR
-	summary_df <- rbind(
-		cbind(fsr_calibration_df(df, "expression_FSR"), fsr_type="Expression FSR"),
-		cbind(fsr_calibration_df(df, "genetic_FSR"), fsr_type="Genetic FSR"))
-	summary_df$fsr_type <- factor(summary_df$fsr_type, levels=c("Expression FSR", "Genetic FSR"))
-	pp <- calibration_plot(summary_df, "Expected FSR (bin mean)", "Fraction of genes with observed r < 0", row_var="fsr_type") + ggtitle(paste0(tissue, ", ", gene_set_label))
-	save_plot(pp, "fsr_calibration", gene_set_suffix, panel_width, 6)
-
-	# 3b. Expression and genetic FSR calibration, each alone, in equal-count bins (deciles) of the FSR, on its own scale
-	df$false_sign <- as.numeric(df$observed_r < 0)
-	for (fsr in list(c("expression_FSR", "Expected expression FSR (decile mean)", "expression_fsr_calibration_deciles"),
-	                 c("genetic_FSR", "Expected genetic FSR (decile mean)", "genetic_fsr_calibration_deciles"))) {
-		summary_df <- binned_calibration_df(df, fsr[1], "false_sign")
-		if (!is.null(summary_df)) {
-			pp <- calibration_plot(summary_df, fsr[2], "Fraction of genes with observed r < 0") + ggtitle(paste0(tissue, ", ", gene_set_label))
-			save_plot(pp, fsr[3], gene_set_suffix, panel_width, 3.4)
-		}
-	}
-
-	# 3c. Genes called at each FSR threshold: observed fraction with r < 0 (95% interval; number of genes called above), the mean FSR of the
-	# called genes (expected; open points) and the threshold itself (grey dash)
-	threshold_df <- rbind(
-		cbind(fsr_threshold_df(df, "expression_FSR"), fsr_type="Expression FSR"),
-		cbind(fsr_threshold_df(df, "genetic_FSR"), fsr_type="Genetic FSR"))
-	threshold_df$fsr_type <- factor(threshold_df$fsr_type, levels=c("Expression FSR", "Genetic FSR"))
-	threshold_df$threshold_label <- factor(threshold_df$threshold, levels=fsr_thresholds)
-	pp <- ggplot(threshold_df, aes(x=threshold_label, group=panel, color=panel)) +
-		geom_errorbar(aes(ymin=threshold, ymax=threshold), width=.5, color="#A3ACB6", linewidth=.6) +
-		geom_line(aes(y=expected), linewidth=.35, linetype="dotted") +
-		geom_point(aes(y=expected), size=1.6, shape=1) +
-		geom_errorbar(aes(ymin=observed - 1.96 * observed_se, ymax=observed + 1.96 * observed_se), width=0) +
-		geom_line(aes(y=observed), linewidth=.35) +
-		geom_point(aes(y=observed), size=1.6) +
-		geom_text(aes(y=observed + 1.96 * observed_se, label=n), vjust=-.6, size=2.4, show.legend=FALSE) +
-		scale_color_manual(values=fold_colors, guide="none") +
-		scale_y_continuous(expand=expansion(mult=c(.05, .15))) +
-		facet_grid(fsr_type ~ panel, scales="free_y") +
-		labs(x="FSR threshold (genes with FSR <= threshold)", y="Fraction of called genes with observed r < 0") +
-		ggtitle(paste0(tissue, ", ", gene_set_label)) +
-		figure_theme()
-	save_plot(pp, "fsr_threshold_calibration", gene_set_suffix, panel_width, 6)
-
-	# 3d. As 3c for the expression FSR, pooled panel only: observed (95% interval; number of genes called above) and expected, with a legend
-	pooled_df <- threshold_df[threshold_df$panel == "Pooled" & threshold_df$fsr_type == "Expression FSR", ]
-	series_levels <- c("Observed: fraction with r < 0", "Expected: mean FSR of called genes")
-	long_df <- rbind(
-		data.frame(threshold_label=pooled_df$threshold_label, series=series_levels[1], y=pooled_df$observed, y_se=pooled_df$observed_se, n=pooled_df$n),
-		data.frame(threshold_label=pooled_df$threshold_label, series=series_levels[2], y=pooled_df$expected, y_se=NA, n=NA))
-	long_df$series <- factor(long_df$series, levels=series_levels)
-	observed_df <- long_df[long_df$series == series_levels[1], ]
-	pp <- ggplot(long_df, aes(x=threshold_label, y=y, group=series, color=series, linetype=series, shape=series)) +
-		geom_errorbar(data=observed_df, aes(ymin=y - 1.96 * y_se, ymax=y + 1.96 * y_se), width=0, linetype="solid", show.legend=FALSE) +
-		geom_line(linewidth=.45) +
-		geom_point(size=1.9) +
-		geom_text(data=observed_df, aes(y=y + 1.96 * y_se, label=n), vjust=-.6, size=2.6, show.legend=FALSE) +
-		scale_color_manual(values=setNames(c("#3E4A56", "#E0457B"), series_levels)) +
-		scale_linetype_manual(values=setNames(c("solid", "dashed"), series_levels)) +
-		scale_shape_manual(values=setNames(c(16, 1), series_levels)) +
-		scale_y_continuous(expand=expansion(mult=c(.05, .12))) +
-		labs(x="Expression FSR threshold (genes with FSR <= threshold)", y="Fraction of called genes with observed r < 0") +
-		ggtitle(paste0(tissue, ", ", gene_set_label, ", pooled folds")) +
-		figure_theme() +
-		theme(legend.direction="vertical")
-	save_plot(pp, "expression_fsr_threshold_calibration_pooled", gene_set_suffix, 5, 4.5)
-
-	# 4. Coverage of the posterior predictive intervals of the observed correlation
-	rows <- list()
-	for (panel in fold_levels) {
-		sub_df <- df[df$panel == panel & !is.na(df$observed_r) & !is.na(df$expected_r), ]
-		for (level in coverage_levels) {
-			inside <- as.numeric(sub_df$observed_r >= sub_df[[paste0("expected_r_lb_", level)]] & sub_df$observed_r <= sub_df[[paste0("expected_r_ub_", level)]])
-			rows[[length(rows) + 1]] <- data.frame(panel=panel, x=level / 100, x_se=0, y=mean(inside), y_se=cluster_se_of_mean(inside, sub_df$gene_id))
-		}
-	}
-	summary_df <- do.call(rbind, rows)
-	summary_df$panel <- factor(summary_df$panel, levels=fold_levels)
-	pp <- calibration_plot(summary_df, "Nominal level", "Empirical coverage") + ggtitle(paste0(tissue, ", ", gene_set_label))
-	save_plot(pp, "predictive_interval_coverage", gene_set_suffix, panel_width, 3.4)
-
-	# 5. Mean observed correlation of the top N genes under each ranking
-	rankings <- list(
-		"Expected r"=function(d) d$expected_r,
-		"Expected r - 1 SD"=function(d) d$expected_r - d$expected_r_sd,
-		"1 - expression FSR"=function(d) 1 - d$expression_FSR,
-		"Expected cis-h2"=function(d) d$expected_cis_h2,
-		"Max PIP"=function(d) d$max_pip,
-		"Sum PIP"=function(d) d$sum_pip,
-		"Training HE cis-h2"=function(d) d$cis_snp_h2_he_train,
-		"Training cis-h2 -log10 p"=function(d) -log10(d$cis_snp_h2_pvalue_train))
-	rows <- list()
-	for (panel in fold_levels) {
-		sub_df <- df[df$panel == panel & !is.na(df$observed_r), ]
-		for (ranking in names(rankings)) {
-			score <- rankings[[ranking]](sub_df)
-			valid <- !is.na(score)
-			if (sum(valid) < top_n_min_genes) {
-				next
-			}
-			ordering <- order(-score[valid])
-			ordered_r <- sub_df$observed_r[valid][ordering]
-			running_mean <- cumsum(ordered_r) / seq_along(ordered_r)
-			running_fsr <- cumsum(sub_df$false_sign[valid][ordering]) / seq_along(ordered_r)
-			running_expected_fsr <- cumsum(sub_df$expression_FSR[valid][ordering]) / seq_along(ordered_r)
-			top_n <- unique(round(10^seq(log10(top_n_min_genes), log10(length(ordered_r)), length.out=200)))
-			rows[[length(rows) + 1]] <- data.frame(panel=panel, ranking=ranking, top_n=top_n, mean_observed_r=running_mean[top_n],
-				observed_fsr=running_fsr[top_n], expected_fsr=running_expected_fsr[top_n])
-		}
-	}
-	top_n_df <- do.call(rbind, rows)
-	top_n_df$panel <- factor(top_n_df$panel, levels=fold_levels)
-	top_n_df$ranking <- factor(top_n_df$ranking, levels=names(rankings))
-	pp <- ggplot(top_n_df, aes(x=top_n, y=mean_observed_r, color=ranking)) +
-		geom_line(linewidth=.5) +
-		scale_x_log10() +
-		facet_wrap(~panel, nrow=1) +
-		labs(x="Top N genes", y="Mean observed held-out correlation") +
-		ggtitle(paste0(tissue, ", ", gene_set_label)) +
-		figure_theme()
-	save_plot(pp, "top_n_genes_mean_observed_r", gene_set_suffix, panel_width, 4)
-
-	# 5b. Observed FSR (fraction with a negative observed correlation) of the top N genes under each ranking. Dashed black: the mean expression
-	# FSR of the top N genes under the expression-FSR ranking, i.e. that ranking's expected observed FSR
-	pp <- ggplot(top_n_df, aes(x=top_n, y=observed_fsr, color=ranking)) +
-		geom_line(linewidth=.5) +
-		geom_line(data=top_n_df[top_n_df$ranking == "1 - expression FSR", ], aes(y=expected_fsr), color="black", linetype="dashed", linewidth=.4) +
-		scale_x_log10() +
-		facet_wrap(~panel, nrow=1) +
-		labs(x="Top N genes", y="Fraction of top N genes with observed r < 0") +
-		ggtitle(paste0(tissue, ", ", gene_set_label)) +
-		figure_theme()
-	save_plot(pp, "top_n_genes_observed_fsr", gene_set_suffix, panel_width, 4)
-
-	# 5c. As 5b, one panel and the expression-FSR ranking only: observed and expected FSR of the top N genes, with a legend. Pooled folds with
-	# a log10 x-axis, and fold 1 alone with a linear x-axis. The running FSRs are recomputed at every N here (5b keeps 200 log-spaced N).
-	series_levels <- c("Observed: fraction with r < 0", "Expected: mean expression FSR")
-	for (version in list(list(panel="Pooled", log_x=TRUE, plot_name="top_n_genes_observed_fsr_expression_fsr_pooled", title_suffix="pooled folds"),
-	                     list(panel="Fold 1", log_x=FALSE, plot_name="top_n_genes_observed_fsr_expression_fsr_fold_1_linear", title_suffix="fold 1"))) {
-		sub_df <- df[df$panel == version$panel & !is.na(df$observed_r) & !is.na(df$expression_FSR), ]
-		if (nrow(sub_df) < top_n_min_genes) {
+	threshold_arr = c()
+	n_gene_arr = c()
+	observed_arr = c()
+	observed_lb_arr = c()
+	observed_ub_arr = c()
+	expected_arr = c()
+	for (threshold in fsr_thresholds) {
+		called_df = df[df[[fsr_col]] <= threshold, ]
+		if (nrow(called_df) == 0) {
 			next
 		}
-		ordering <- order(sub_df$expression_FSR)
-		n_genes <- seq_along(ordering)
-		long_df <- rbind(
-			data.frame(top_n=n_genes, series=series_levels[1], y=cumsum(sub_df$false_sign[ordering]) / n_genes),
-			data.frame(top_n=n_genes, series=series_levels[2], y=cumsum(sub_df$expression_FSR[ordering]) / n_genes))
-		long_df <- long_df[long_df$top_n >= top_n_min_genes, ]
-		long_df$series <- factor(long_df$series, levels=series_levels)
-		pp <- ggplot(long_df, aes(x=top_n, y=y, color=series, linetype=series)) +
-			geom_line(linewidth=.55) +
-			scale_color_manual(values=setNames(c("#3E4A56", "#E0457B"), series_levels)) +
-			scale_linetype_manual(values=setNames(c("solid", "dashed"), series_levels)) +
-			labs(x="Top N genes, ranked by expression FSR", y="Fraction of top N genes with observed r < 0") +
-			ggtitle(paste0(tissue, ", ", version$title_suffix, "\n", gene_set_label)) +
-			figure_theme() +
-			theme(legend.direction="vertical")
-		if (version$log_x) {
-			pp <- pp + scale_x_log10()
-		}
-		save_plot(pp, version$plot_name, gene_set_suffix, 5, 4.5)
+		observed = mean(called_df$false_sign)
+		observed_se = sqrt(observed*(1.0 - observed) / nrow(called_df))
+
+		threshold_arr = c(threshold_arr, threshold)
+		n_gene_arr = c(n_gene_arr, nrow(called_df))
+		observed_arr = c(observed_arr, observed)
+		observed_lb_arr = c(observed_lb_arr, observed - 1.96*observed_se)
+		observed_ub_arr = c(observed_ub_arr, observed + 1.96*observed_se)
+		expected_arr = c(expected_arr, mean(called_df[[fsr_col]]))
 	}
 
-	# 7. Heritability: (a) held-out HE h2 against expected cis-h2; (b) held-out HE h2 against the training-fold estimates
-	summary_df <- binned_calibration_df(df, "expected_cis_h2", "cis_snp_h2_he_test")
-	pp_a <- calibration_plot(summary_df, "Expected cis-h2 (held-out individuals)", "Held-out HE cis-h2") + ggtitle(paste0(tissue, ", ", gene_set_label))
-	summary_df <- rbind(
-		cbind(binned_calibration_df(df, "posterior_cis_h2_train", "cis_snp_h2_he_test"), training_estimate="Posterior, training"),
-		cbind(binned_calibration_df(df, "cis_snp_h2_he_train", "cis_snp_h2_he_test"), training_estimate="HE, training"))
-	summary_df$training_estimate <- factor(summary_df$training_estimate, levels=c("Posterior, training", "HE, training"))
-	pp_b <- calibration_plot(summary_df, "Training-fold cis-h2", "Held-out HE cis-h2", row_var="training_estimate")
-	save_plot(plot_grid(pp_a, pp_b, ncol=1, rel_heights=c(1, 1.7)), "heritability_calibration", gene_set_suffix, panel_width, 9)
-
-	# 7b. The same on the scale of Var(genetic expression): cis_snp_h2_he_test is a proportion of the held-out variance of expression, while
-	# expected_cis_h2 is a variance. (a) held-out HE times var_y against expected cis-h2; (b) the held-out variance of expression, which is 1 if the
-	# two scales agree. Evaluations made before these columns were added have no such plot
-	if ("cis_snp_h2_he_var_test" %in% colnames(df)) {
-		summary_df <- binned_calibration_df(df, "expected_cis_h2", "cis_snp_h2_he_var_test")
-		pp_a <- calibration_plot(summary_df, "Expected cis-h2 (held-out individuals)", "Held-out HE cis-h2 x Var(y)") + ggtitle(paste0(tissue, ", ", gene_set_label))
-		summary_df <- binned_calibration_df(df, "expected_cis_h2", "var_y_test")
-		pp_b <- ggplot(summary_df, aes(x=x, y=y, color=panel)) +
-			geom_hline(yintercept=1, linetype="dashed", color="#7E8A97") +
-			geom_errorbar(aes(ymin=y - 1.96 * y_se, ymax=y + 1.96 * y_se), width=0) +
-			geom_line(linewidth=.35) +
-			geom_point(size=1.6) +
-			scale_color_manual(values=fold_colors, guide="none") +
-			facet_wrap(~panel, nrow=1) +
-			labs(x="Expected cis-h2 (held-out individuals)", y="Held-out Var(y)") +
-			figure_theme()
-		save_plot(plot_grid(pp_a, pp_b, ncol=1), "heritability_calibration_variance_scale", gene_set_suffix, panel_width, 6.5)
-	}
-
-	# 7c. Expected cis-h2 with the correlations between variants set to 0 (sum of squared effects): (a) against held-out HE times var_y; (b) against the
-	# usual expected cis-h2, Var(X beta), where points above y = x mean that LD between a sample's effects lowers Var(X beta) and below that it raises it
-	if ("expected_cis_h2_independent" %in% colnames(df) & "cis_snp_h2_he_var_test" %in% colnames(df)) {
-		summary_df <- binned_calibration_df(df, "expected_cis_h2_independent", "cis_snp_h2_he_var_test")
-		pp_a <- calibration_plot(summary_df, "Expected cis-h2, independent variants", "Held-out HE cis-h2 x Var(y)") + ggtitle(paste0(tissue, ", ", gene_set_label))
-		summary_df <- binned_calibration_df(df, "expected_cis_h2", "expected_cis_h2_independent")
-		pp_b <- calibration_plot(summary_df, "Expected cis-h2, Var(X beta)", "Expected cis-h2, independent variants")
-		save_plot(plot_grid(pp_a, pp_b, ncol=1), "heritability_calibration_independent_snps", gene_set_suffix, panel_width, 6.5)
-	}
-
-	# 7d. What the model predicts held-out HE to be, given how HE weights LD: (a) observed against predicted held-out HE times var_y; (b) predicted HE
-	# against expected cis-h2, which is how far HE sits from Var(X beta) under the model's effects
-	if ("expected_cis_snp_h2_he_var_test" %in% colnames(df)) {
-		summary_df <- binned_calibration_df(df, "expected_cis_snp_h2_he_var_test", "cis_snp_h2_he_var_test")
-		pp_a <- calibration_plot(summary_df, "Model-predicted held-out HE cis-h2 x Var(y)", "Held-out HE cis-h2 x Var(y)") + ggtitle(paste0(tissue, ", ", gene_set_label))
-		summary_df <- binned_calibration_df(df, "expected_cis_h2", "expected_cis_snp_h2_he_var_test")
-		pp_b <- calibration_plot(summary_df, "Expected cis-h2, Var(X beta)", "Model-predicted held-out HE cis-h2 x Var(y)")
-		save_plot(plot_grid(pp_a, pp_b, ncol=1), "heritability_calibration_predicted_he", gene_set_suffix, panel_width, 6.5)
-	}
-}
-
-gene_sets <- list(
-	list(df=gene_fold_df, suffix="_all_genes", label="all genes"),
-	list(df=gene_fold_df[!is.na(gene_fold_df$cis_snp_h2_pvalue_train) & gene_fold_df$cis_snp_h2_pvalue_train < heritability_pvalue_threshold, ], suffix="_heritable_genes", label=paste0("heritable genes (training LRT p < ", heritability_pvalue_threshold, ")")))
-for (gene_set in gene_sets) {
-	print(paste0(gene_set$label, ": ", nrow(gene_set$df), " gene-fold rows"))
-	make_gene_level_plots(gene_set$df, gene_set$suffix, gene_set$label)
+	summary_df = data.frame(threshold=threshold_arr, n_genes=n_gene_arr, observed=observed_arr, observed_lb=observed_lb_arr, observed_ub=observed_ub_arr, expected=expected_arr)
+	summary_df$threshold_label = factor(summary_df$threshold, levels=fsr_thresholds)
+	return(summary_df)
 }
 
 
-#####################
-# 3e. Expression FSR calibration within strata of the genes (all genes). Every stratifier is a training-fold quantity, so calibration should hold
-# within each stratum if the model is right. Where the excess of observed r < 0 sits says where the over-confidence comes from:
-#   training LRT p-value (model-free evidence of cis heritability): an excess in the weak-evidence strata points to a shared prior that is too
-#       generous to genes with little or no cis signal
-#   number of cis variants: the prior's expected number of eQTLs is proportional to it (README.md, section 5f)
-#   Monte Carlo fraction y_hat_mc_variance / V (evaluations with that column): an excess where it is large points to the Monte Carlo error that
-#       y_hat shares with the predictive draws (section 7)
-# Pdfs <tissue>_expression_fsr_calibration_by_<stratifier>_all_genes.pdf (equal-count deciles of the FSR within each stratum), and
-# <tissue>_expression_fsr_mid_range_by_stratum_all_genes.txt: genes with expression FSR in (mid_range_fsr[1], mid_range_fsr[2]], per stratum
-# and panel: number of gene-fold rows, mean FSR (expected), fraction with observed r < 0 (observed) and its clustered standard error
-#####################
-mid_range_fsr <- c(0.1, 0.4)
-
-quantile_strata <- function(x, n, label) {
-	breaks <- unique(quantile(x, probs=seq(0, 1, length.out=n + 1), na.rm=TRUE))
-	labels <- paste0(label, " ", signif(breaks[-length(breaks)], 2), " to ", signif(breaks[-1], 2))
-	return(cut(x, breaks=breaks, labels=labels, include.lowest=TRUE))
-}
-
-stratifiers <- list(
-	list(name="training_pvalue", label="training LRT p-value",
-	     strata=cut(gene_fold_df$cis_snp_h2_pvalue_train, breaks=c(-Inf, 0.001, 0.05, 0.5, Inf), right=FALSE,
-	                labels=c("LRT p < 0.001", "LRT p 0.001 to 0.05", "LRT p 0.05 to 0.5", "LRT p >= 0.5"))),
-	list(name="n_cis_variants", label="number of cis variants", strata=quantile_strata(gene_fold_df$n_cis_variants, 3, "cis variants")))
-if ("y_hat_mc_variance" %in% colnames(gene_fold_df)) {
-	stratifiers[[length(stratifiers) + 1]] <- list(name="mc_fraction", label="Monte Carlo fraction of V",
-		strata=quantile_strata(gene_fold_df$y_hat_mc_variance / gene_fold_df$predicted_expression_variance, 4, "MC fraction"))
-}
-
-mid_range_rows <- list()
-for (stratifier in stratifiers) {
-	df <- gene_fold_df
-	df$stratum <- stratifier$strata
-	df$false_sign <- as.numeric(df$observed_r < 0)
-	df <- with_pooled_panel(df[!is.na(df$stratum), ])
-	summary_rows <- list()
-	for (stratum in levels(df$stratum)) {
-		stratum_df <- df[df$stratum == stratum, ]
-		summary_df <- binned_calibration_df(stratum_df, "expression_FSR", "false_sign")
-		if (!is.null(summary_df)) {
-			summary_rows[[length(summary_rows) + 1]] <- cbind(summary_df, stratum=stratum)
-		}
-		for (panel in fold_levels) {
-			mid_df <- stratum_df[stratum_df$panel == panel & !is.na(stratum_df$expression_FSR) & !is.na(stratum_df$observed_r) &
-			                     stratum_df$expression_FSR > mid_range_fsr[1] & stratum_df$expression_FSR <= mid_range_fsr[2], ]
-			if (nrow(mid_df) == 0) {
-				next
-			}
-			mid_range_rows[[length(mid_range_rows) + 1]] <- data.frame(stratifier=stratifier$name, stratum=stratum, panel=panel, n=nrow(mid_df),
-				expected=mean(mid_df$expression_FSR), observed=mean(mid_df$false_sign), observed_se=cluster_se_of_mean(mid_df$false_sign, mid_df$gene_id))
-		}
+compute_fsr_threshold_summary_df_by_fold <- function(df, fsr_col, fsr_thresholds, folds) {
+	# compute_fsr_threshold_summary_df within each fold, stacked, with a "Fold <k>" label column
+	summary_df_list = list()
+	for (fold in folds) {
+		fold_summary_df = compute_fsr_threshold_summary_df(df[df$fold == fold, ], fsr_col, fsr_thresholds)
+		fold_summary_df$fold = paste0("Fold ", fold)
+		summary_df_list[[length(summary_df_list) + 1]] = fold_summary_df
 	}
-	if (length(summary_rows) == 0) {
-		next
+	summary_df = do.call(rbind, summary_df_list)
+	summary_df$fold = factor(summary_df$fold, levels=paste0("Fold ", folds))
+	return(summary_df)
+}
+
+
+make_fsr_threshold_plot <- function(summary_df, xlab, ylab, point_color=single_color, label_size=2.8) {
+	# At each FSR threshold: observed fraction of called genes with r < 0 (filled points with 95% CI, solid line; number of genes called above),
+	# and the mean FSR of the called genes (expected; open points, dotted line). If summary_df has a fold column, one panel per fold, colored by
+	# fold (fold_colors); otherwise everything is drawn in point_color. A legend (black keys, so it serves every fold color) for observed and
+	# expected sits inside the top left of the (first) panel.
+	series_levels = c("Observed", "Expected")
+	by_fold = "fold" %in% colnames(summary_df)
+	if (by_fold) {
+		pp = ggplot(summary_df, aes(x=threshold_label, group=fold, color=fold))
+	} else {
+		summary_df$series = "single"
+		pp = ggplot(summary_df, aes(x=threshold_label, group=series, color=series))
 	}
-	summary_df <- do.call(rbind, summary_rows)
-	summary_df$stratum <- factor(summary_df$stratum, levels=levels(df$stratum))
-	pp <- calibration_plot(summary_df, "Expected expression FSR (decile mean)", "Fraction of genes with observed r < 0", row_var="stratum") +
-		ggtitle(paste0(tissue, ", all genes, by ", stratifier$label))
-	save_plot(pp, paste0("expression_fsr_calibration_by_", stratifier$name), "_all_genes", 2.6 * length(fold_levels), 2.4 * length(levels(summary_df$stratum)) + 1)
-}
-if (length(mid_range_rows) > 0) {
-	mid_range_df <- do.call(rbind, mid_range_rows)
-	write.table(mid_range_df, paste0(viz_dir, tissue, "_expression_fsr_mid_range_by_stratum_all_genes.txt"), sep="\t", quote=FALSE, row.names=FALSE)
-	print(mid_range_df[mid_range_df$panel == "Pooled", ])
-}
-
-
-#####################
-# 8. Distribution of the genetic FSR in fold 1: (a) all genes, (b) heritable genes (training LRT p < heritability_pvalue_threshold), stacked
-# on the same x axis (<tissue>_genetic_fsr_histogram_fold_1.pdf). Genes with constant held-out predictions (genetic FSR NA) are left out.
-#####################
-fold_1_df <- gene_fold_df[gene_fold_df$fold == 1 & !is.na(gene_fold_df$genetic_FSR), ]
-if (nrow(fold_1_df) > 0) {
-	heritable <- !is.na(fold_1_df$cis_snp_h2_pvalue_train) & fold_1_df$cis_snp_h2_pvalue_train < heritability_pvalue_threshold
-	panel_levels <- c(paste0("a. All genes (n = ", nrow(fold_1_df), ")"),
-	                  paste0("b. Heritable genes, training LRT p < ", heritability_pvalue_threshold, " (n = ", sum(heritable), ")"))
-	hist_df <- rbind(
-		data.frame(genetic_FSR=fold_1_df$genetic_FSR, gene_set=panel_levels[1]),
-		data.frame(genetic_FSR=fold_1_df$genetic_FSR[heritable], gene_set=panel_levels[2]))
-	hist_df$gene_set <- factor(hist_df$gene_set, levels=panel_levels)
-	pp <- ggplot(hist_df, aes(x=genetic_FSR)) +
-		geom_histogram(binwidth=0.01, boundary=0, fill=fold_colors[["Fold 1"]], color=NA) +
-		facet_wrap(~gene_set, ncol=1, scales="free_y") +
-		labs(x="Genetic FSR", y="Genes") +
-		ggtitle(paste0(tissue, ", fold 1")) +
+	pp = pp +
+		geom_line(aes(y=expected, linetype=series_levels[2]), linewidth=0.5) +
+		geom_point(aes(y=expected, shape=series_levels[2]), size=1.8) +
+		geom_line(aes(y=observed, linetype=series_levels[1]), linewidth=0.7) +
+		geom_pointrange(aes(y=observed, ymin=observed_lb, ymax=observed_ub), linewidth=0.7, size=0.4, show.legend=FALSE) +
+		geom_point(aes(y=observed, shape=series_levels[1]), size=1.6) +
+		geom_text(aes(y=observed_ub, label=n_genes), vjust=-0.7, size=label_size, show.legend=FALSE) +
+		scale_linetype_manual(name=NULL, values=setNames(c("solid", "dotted"), series_levels), breaks=series_levels) +
+		scale_shape_manual(name=NULL, values=setNames(c(16, 1), series_levels), breaks=series_levels) +
+		scale_y_continuous(expand=expansion(mult=c(0.05, 0.12))) +
 		figure_theme() +
-		theme(strip.text=element_text(hjust=0))
-	ggsave(paste0(viz_dir, tissue, "_genetic_fsr_histogram_fold_1.pdf"), pp, width=6, height=6, units="in")
+		theme(legend.position="inside", legend.position.inside=c(0.01, 0.99), legend.justification=c(0, 1), legend.background=element_blank(),
+		      legend.key=element_blank(), legend.key.width=unit(1.6, "lines")) +
+		labs(x=xlab, y=ylab)
+	if (by_fold) {
+		pp = pp + scale_color_manual(values=fold_colors, guide="none") + facet_wrap(~fold, nrow=1) +
+			theme(strip.background=element_blank(), strip.text=element_text(size=11), panel.spacing=unit(1.2, "lines"), axis.text.x=element_text(angle=45, hjust=1),
+			      legend.text=element_text(size=9), legend.key.height=unit(0.9, "lines"))
+	} else {
+		pp = pp + scale_color_manual(values=c(single=point_color), guide="none")
+	}
+	return(pp)
+}
+
+
+assign_quantile_bins <- function(x, n_bins, format_value, display_x=x) {
+	# Split x into n_bins equal-count bins (ties broken by row order, as for the FSR deciles), bin 1 holding the smallest x. Returns a factor
+	# whose labels give the bin and the range of display_x (by default x) in it, formatted with format_value.
+	bin_id = ceiling(rank(x, ties.method="first") / length(x) * n_bins)
+	bin_labels = c()
+	for (bin_iter in 1:n_bins) {
+		bin_range = range(display_x[bin_id == bin_iter])
+		bin_labels = c(bin_labels, paste0("Q", bin_iter, "\n[", format_value(bin_range[1]), ", ", format_value(bin_range[2]), "]"))
+	}
+	return(factor(bin_labels[bin_id], levels=bin_labels))
+}
+
+
+make_violin_plot <- function(df, bin_col, value_col, xlab, ylab, fill_color=single_color) {
+	# Violin of value_col within each bin of bin_col (each violin scaled to the same width), with a boxplot (median and quartiles) inside
+	pp = ggplot(df, aes(x=.data[[bin_col]], y=.data[[value_col]])) +
+		geom_violin(fill=fill_color, color=fill_color, alpha=0.55, scale="width", linewidth=0.4) +
+		geom_boxplot(width=0.12, outlier.shape=NA, fill="white", color="black", linewidth=0.4) +
+		figure_theme() +
+		labs(x=xlab, y=ylab)
+	return(pp)
+}
+
+
+
+compute_coverage_by_decile_summary_df <- function(df, x_col, coverage_levels, n_bins) {
+	# Split genes into n_bins equal-count bins by x_col. In each bin and at each nominal level L (in %), the fraction of genes whose observed
+	# held-out correlation lies inside their L% posterior predictive interval, with a 95% binomial (normal approximation) CI.
+	df = df[!is.na(df[[x_col]]) & !is.na(df$observed_r), ]
+	bin_id = ceiling(rank(df[[x_col]], ties.method="first") / nrow(df) * n_bins)
+
+	rows = list()
+	for (bin_iter in 1:n_bins) {
+		bin_df = df[bin_id == bin_iter, ]
+		for (level in coverage_levels) {
+			lb = bin_df[[paste0("expected_r_lb_", level)]]
+			ub = bin_df[[paste0("expected_r_ub_", level)]]
+			keep = !is.na(lb) & !is.na(ub)
+			covered = (bin_df$observed_r[keep] >= lb[keep]) & (bin_df$observed_r[keep] <= ub[keep])
+			coverage = mean(covered)
+			coverage_se = sqrt(coverage*(1.0 - coverage) / sum(keep))
+			rows[[length(rows) + 1]] = data.frame(bin=bin_iter, level=level, n_genes=sum(keep), mean_x=mean(bin_df[[x_col]]), coverage=coverage,
+				coverage_lb=coverage - 1.96*coverage_se, coverage_ub=coverage + 1.96*coverage_se)
+		}
+	}
+	summary_df = do.call(rbind, rows)
+	summary_df$level_label = factor(paste0(summary_df$level, "%"), levels=paste0(coverage_levels, "%"))
+	return(summary_df)
+}
+
+
+make_coverage_by_decile_plot <- function(summary_df, xlab, ylab) {
+	# Coverage (points with 95% CI, joined by a line) against the decile mean of the binning quantity, one color per nominal level, with a dashed
+	# horizontal line at each nominal level in its color
+	level_colors = setNames(hcl.colors(nlevels(summary_df$level_label) + 1, "Plasma")[1:nlevels(summary_df$level_label)], levels(summary_df$level_label))
+	reference_df = unique(summary_df[, c("level", "level_label")])
+
+	pp = ggplot(summary_df, aes(x=mean_x, y=coverage, color=level_label)) +
+		geom_hline(data=reference_df, aes(yintercept=level / 100, color=level_label), linetype="dashed", linewidth=0.5, show.legend=FALSE) +
+		geom_line(linewidth=0.7) +
+		geom_pointrange(aes(ymin=coverage_lb, ymax=coverage_ub), linewidth=0.6, size=0.35) +
+		scale_color_manual(values=level_colors, name="Nominal level") +
+		figure_theme() +
+		labs(x=xlab, y=ylab)
+	return(pp)
+}
+
+
+compute_top_n_summary_df <- function(df, rankings, top_n_min_genes, value_col="observed_r") {
+	# For each ranking (a named list of functions of the gene table, higher = better), rank the genes and give the mean of value_col over the top
+	# N genes (observed_r: mean observed held-out correlation; true_sign: 1 - observed FSR, the fraction with r >= 0), at about 200 values of N spaced
+	# evenly on a log scale from top_n_min_genes to all genes, plus about 200 spaced evenly on a linear scale (for a linear x axis in
+	# make_top_n_plot). A ranking function returns either a score or a list of scores: the first orders
+	# the genes and the later ones break its ties, in turn (remaining ties keep the order of the rows). Genes with any score missing are left out.
+	df = df[!is.na(df[[value_col]]), ]
+	rows = list()
+	for (ranking in names(rankings)) {
+		scores = rankings[[ranking]](df)
+		if (!is.list(scores)) {
+			scores = list(scores)
+		}
+		valid = Reduce(`&`, lapply(scores, function(score) !is.na(score)))
+		if (sum(valid) < top_n_min_genes) {
+			next
+		}
+		ordering = do.call(order, lapply(scores, function(score) -score[valid]))
+		ordered_value = df[[value_col]][valid][ordering]
+		running_mean = cumsum(ordered_value) / seq_along(ordered_value)
+		n_genes = length(ordered_value)
+		top_n = sort(unique(round(c(10^seq(log10(top_n_min_genes), log10(n_genes), length.out=200), seq(top_n_min_genes, n_genes, length.out=200)))))
+		rows[[length(rows) + 1]] = data.frame(ranking=ranking, top_n=top_n, mean_value=running_mean[top_n])
+	}
+	summary_df = do.call(rbind, rows)
+	summary_df$ranking = factor(summary_df$ranking, levels=names(rankings))
+	return(summary_df)
+}
+
+
+compute_top_n_summary_df_by_fold <- function(df, rankings, top_n_min_genes, folds, value_col="observed_r") {
+	# compute_top_n_summary_df within each fold, stacked, with a "Fold <k>" label column
+	summary_df_list = list()
+	for (fold in folds) {
+		fold_summary_df = compute_top_n_summary_df(df[df$fold == fold, ], rankings, top_n_min_genes, value_col)
+		fold_summary_df$fold = paste0("Fold ", fold)
+		summary_df_list[[length(summary_df_list) + 1]] = fold_summary_df
+	}
+	summary_df = do.call(rbind, summary_df_list)
+	summary_df$fold = factor(summary_df$fold, levels=paste0("Fold ", folds))
+	return(summary_df)
+}
+
+
+make_top_n_plot <- function(summary_df, xlab, ylab, log_x=TRUE, legend_bottom=FALSE) {
+	# Mean value over the top N genes (compute_top_n_summary_df) against N (log scale, or linear with log_x=FALSE), one line per ranking
+	# (ranking_colors). If summary_df has a fold column, one panel per fold with the legend below; otherwise the legend is on the right (below,
+	# in three rows, with legend_bottom).
+	if (log_x) {
+		x_scale = scale_x_log10()
+	} else {
+		x_scale = scale_x_continuous()
+	}
+	pp = ggplot(summary_df, aes(x=top_n, y=mean_value, color=ranking)) +
+		geom_line(linewidth=0.7) +
+		x_scale +
+		scale_color_manual(values=ranking_colors, name="Ranking") +
+		figure_theme() +
+		labs(x=xlab, y=ylab)
+	by_fold = "fold" %in% colnames(summary_df)
+	if (by_fold) {
+		pp = pp + facet_wrap(~fold, nrow=1) +
+			theme(strip.background=element_blank(), strip.text=element_text(size=11), panel.spacing=unit(1.2, "lines"))
+	}
+	if (by_fold | legend_bottom) {
+		pp = pp + guides(color=guide_legend(nrow=3, byrow=TRUE)) + theme(legend.position="bottom", legend.title=element_blank(), legend.key=element_blank())
+	} else {
+		pp = pp + theme(legend.key=element_blank())
+	}
+	return(pp)
+}
+
+
+make_histogram <- function(df, value_col, bin_width, xlab, ylab, fill_color=single_color) {
+	# Histogram of value_col in bins of width bin_width, starting at 0
+	df = df[!is.na(df[[value_col]]), ]
+	pp = ggplot(df, aes(x=.data[[value_col]])) +
+		geom_histogram(binwidth=bin_width, boundary=0, fill=fill_color, color="white", linewidth=0.3) +
+		scale_y_continuous(expand=expansion(mult=c(0, 0.05))) +
+		figure_theme() +
+		labs(x=xlab, y=ylab)
+	return(pp)
+}
+
+
+make_scatter_plot <- function(df, x_col, y_col, xlab, ylab, point_color=single_color) {
+	# Scatter of y_col against x_col, one point per gene (small and semi-transparent, since there are thousands of genes)
+	pp = ggplot(df, aes(x=.data[[x_col]], y=.data[[y_col]])) +
+		geom_point(color=point_color, size=0.6, alpha=0.35, stroke=0) +
+		figure_theme() +
+		labs(x=xlab, y=ylab)
+	return(pp)
 }
 
 
 #####################
-# 6. Hyper-parameters
+# Command line args
 #####################
-# (a) Traces, with the fraction of non-zero effects 1 - pi0 in place of pi0; dotted line at the first retained iteration
-trace_df$fold_label <- factor(paste0("Fold ", trace_df$fold), levels=fold_levels)
-trace_df$value[trace_df$hyperparameter == "pi0"] <- 1 - trace_df$value[trace_df$hyperparameter == "pi0"]
-trace_df$hyperparameter[trace_df$hyperparameter == "pi0"] <- "1 - pi0"
-hyperparameter_levels <- c("1 - pi0", "pi1", "pi2", "sigma2_1", "sigma2_2")
-trace_df$hyperparameter <- factor(trace_df$hyperparameter, levels=hyperparameter_levels)
-first_retained <- min(trace_df$iteration[trace_df$retained == 1])
-pp_trace <- ggplot(trace_df, aes(x=iteration, y=value, color=fold_label)) +
-	geom_line(linewidth=.3) +
-	geom_vline(xintercept=first_retained, linetype="dotted", color="#7E8A97") +
-	scale_y_log10() +
-	scale_color_manual(values=fold_colors) +
-	facet_wrap(~hyperparameter, nrow=1, scales="free_y") +
-	labs(x="Iteration", y="Value") +
-	ggtitle(paste0(tissue, ": hyper-parameter traces")) +
-	figure_theme()
+organized_stem = args[1]
+viz_dir = args[2]
+tissue = args[3]
+dir.create(viz_dir, showWarnings=FALSE, recursive=TRUE)
 
-# (b) Posterior mean and 95% interval over the retained samples, per fold
-retained_df <- trace_df[trace_df$retained == 1, ]
-posterior_df <- aggregate(value ~ fold_label + hyperparameter, data=retained_df, FUN=mean)
-posterior_df$lb <- aggregate(value ~ fold_label + hyperparameter, data=retained_df, FUN=function(x) quantile(x, 0.025))$value
-posterior_df$ub <- aggregate(value ~ fold_label + hyperparameter, data=retained_df, FUN=function(x) quantile(x, 0.975))$value
-pp_posterior <- ggplot(posterior_df, aes(x=fold_label, y=value, color=fold_label)) +
-	geom_errorbar(aes(ymin=lb, ymax=ub), width=0) +
-	geom_point(size=1.8) +
-	scale_y_log10() +
-	scale_color_manual(values=fold_colors, guide="none") +
-	facet_wrap(~hyperparameter, nrow=1, scales="free_y") +
-	labs(x="", y="Posterior mean (95% interval)") +
-	figure_theme() +
-	theme(axis.text.x=element_text(angle=45, hjust=1))
+# Number of equal-count bins of the expected quantity in the calibration plots
+n_bins = 10
+# Fold shown on its own in Figures 1, 3, 4, 6, 8, 9, 11, 13, 17, 19, 20 and 22
+single_fold = 3
+# Number of equal-count bins of training cis-h2 (and of its p-value) in Figure 3
+n_h2_bins = 5
+# FSR thresholds in Figures 6 and 7 (genes called at FSR <= threshold), and the training-fold cis-h2 LRT p-value threshold of the heritable
+# genes they use (training data only, so selecting on it does not bias the held-out evaluation)
+fsr_thresholds = c(0.001, 0.01, 0.05, 0.1, 0.2, 0.3)
+fsr_threshold_heritable_pvalue_threshold = 0.05
+# Nominal levels (%) of the posterior predictive intervals of the observed correlation in Figures 17 and 18 (the levels in the evaluation files)
+coverage_levels = c(80, 90, 95, 99)
+# Rankings of genes in Figures 20 to 23 (score: higher = better; a list of scores breaks ties in the first by the next, see compute_top_n_summary_df).
+# Thousands of genes have an FSR of exactly 0, so the FSR rankings break ties by the matching expected correlation. The smallest N shown
+top_n_rankings = list(
+	"Expected r"=function(d) d$expected_r,
+	"1 - expression FSR"=function(d) list(1 - d$expression_FSR, d$expected_r),
+	"Expected genetic correlation"=function(d) d$expected_genetic_r,
+	"1 - genetic FSR"=function(d) list(1 - d$genetic_FSR, d$expected_genetic_r),
+	"Expected cis-h2"=function(d) d$expected_cis_h2,
+	"Training HE cis-h2"=function(d) d$cis_snp_h2_he_train,
+	"Training cis-h2 -log10 p"=function(d) -log10(d$cis_snp_h2_pvalue_train))
+top_n_min_genes = 10
 
-# (c) Per gene (all gene-fold rows): number of variants in each slab and cis-h2 implied by the prior (posterior mean hyper-parameters of the
-# fold, times the gene's number of variants) against their posterior expectations
-posterior_wide <- reshape(posterior_df[, c("fold_label", "hyperparameter", "value")], idvar="fold_label", timevar="hyperparameter", direction="wide")
-gene_hyper_df <- merge(transform(gene_fold_df, fold_label=paste0("Fold ", fold)), posterior_wide, by="fold_label")
-implied_rows <- list(
-	data.frame(quantity="Variants in slab 1", source="Prior-implied", value=gene_hyper_df$n_cis_variants * gene_hyper_df[["value.pi1"]]),
-	data.frame(quantity="Variants in slab 1", source="Posterior", value=gene_hyper_df$expected_n_slab1),
-	data.frame(quantity="Variants in slab 2", source="Prior-implied", value=gene_hyper_df$n_cis_variants * gene_hyper_df[["value.pi2"]]),
-	data.frame(quantity="Variants in slab 2", source="Posterior", value=gene_hyper_df$expected_n_slab2),
-	data.frame(quantity="Training cis-h2", source="Prior-implied", value=gene_hyper_df$n_cis_variants * (gene_hyper_df[["value.pi1"]] * gene_hyper_df[["value.sigma2_1"]] + gene_hyper_df[["value.pi2"]] * gene_hyper_df[["value.sigma2_2"]])),
-	data.frame(quantity="Training cis-h2", source="Posterior", value=gene_hyper_df$posterior_cis_h2_train))
-implied_df <- do.call(rbind, implied_rows)
-implied_df$quantity <- factor(implied_df$quantity, levels=c("Variants in slab 1", "Variants in slab 2", "Training cis-h2"))
-implied_df <- implied_df[!is.na(implied_df$value) & implied_df$value > 0, ]
-pp_implied <- ggplot(implied_df, aes(x=value, fill=source)) +
-	geom_histogram(bins=50, alpha=.6, position="identity") +
-	scale_x_log10() +
-	scale_fill_manual(values=c("Prior-implied"="#A3ACB6", "Posterior"="#E0457B")) +
-	facet_wrap(~quantity, nrow=1, scales="free") +
-	labs(x="Per gene (log scale)", y="Gene-fold rows") +
-	figure_theme()
 
-ggsave(paste0(viz_dir, tissue, "_hyperparameters.pdf"), plot_grid(pp_trace, pp_posterior, pp_implied, ncol=1, rel_heights=c(1.1, 1, 1)), width=14, height=10, units="in")
+#####################
+# Load in cross-validation results (one row per gene and held-out fold)
+#####################
+gene_fold_df = read.table(paste0(organized_stem, "_per_gene_fold.txt"), header=TRUE, sep="\t", stringsAsFactors=FALSE, na.strings=c("NA", "nan", "NaN"))
+folds = sort(unique(gene_fold_df$fold))
+# Indicator of a negative held-out correlation (the observed counterpart of the FSR)
+gene_fold_df$false_sign = as.numeric(gene_fold_df$observed_r < 0)
+# Its complement (1 - observed FSR when averaged over genes)
+gene_fold_df$true_sign = 1 - gene_fold_df$false_sign
+
+# Colors: one per fold (figures with a panel per fold), and one for figures without folds
+fold_colors = setNames(hcl.colors(length(folds), "Dark 3"), paste0("Fold ", folds))
+single_color = "#E8590C"
+# One color per gene ranking (Figures 20 to 23)
+ranking_colors = setNames(brewer.pal(8, "Dark2")[1:length(top_n_rankings)], names(top_n_rankings))
+
+
+#####################
+# Figure 1: Expression FSR calibration (deciles of expression FSR), single fold
+#####################
+fold_summary_df = compute_decile_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], "expression_FSR", "false_sign", n_bins)
+fold_plot = make_calibration_plot(fold_summary_df, "Expected expression FSR", "Fraction of genes with observed r < 0")
+output_file = paste0(viz_dir, tissue, "_expression_fsr_calibration_deciles_fold_", single_fold, ".pdf")
+ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 2: Expression FSR calibration (deciles of expression FSR), one panel per fold
+#####################
+by_fold_summary_df = compute_decile_summary_df_by_fold(gene_fold_df, "expression_FSR", "false_sign", n_bins, folds)
+by_fold_plot = make_calibration_plot(by_fold_summary_df, "Expected expression FSR", "Fraction of genes with observed r < 0")
+output_file = paste0(viz_dir, tissue, "_expression_fsr_calibration_deciles_by_fold.pdf")
+ggsave(output_file, by_fold_plot, width=7.2, height=3.0, units="in")
+
+
+
+#####################
+# Figure 3: Distribution of genetic FSR within quintiles of training-fold cis-h2 (ML estimate; top) and of its LRT p-value (bottom), single fold.
+# Both are model-free and use training individuals only. The p-value is binned on -p, so in both panels Q1 is the weakest evidence of cis
+# heritability and Q5 the strongest
+#####################
+h2_df = gene_fold_df[gene_fold_df$fold == single_fold & !is.na(gene_fold_df$genetic_FSR) & !is.na(gene_fold_df$cis_snp_h2_train) & !is.na(gene_fold_df$cis_snp_h2_pvalue_train), ]
+h2_df$h2_bin = assign_quantile_bins(h2_df$cis_snp_h2_train, n_h2_bins, function(v) sprintf("%.3f", v))
+h2_df$h2_pvalue_bin = assign_quantile_bins(-h2_df$cis_snp_h2_pvalue_train, n_h2_bins, function(v) formatC(v, digits=2, format="g"), display_x=h2_df$cis_snp_h2_pvalue_train)
+h2_violin = make_violin_plot(h2_df, "h2_bin", "genetic_FSR", "Training cis-h2 (quintile)", "Genetic FSR")
+h2_pvalue_violin = make_violin_plot(h2_df, "h2_pvalue_bin", "genetic_FSR", "Training cis-h2 LRT p-value (quintile)", "Genetic FSR")
+output_file = paste0(viz_dir, tissue, "_genetic_fsr_by_cis_h2_quintile_fold_", single_fold, ".pdf")
+ggsave(output_file, plot_grid(h2_violin, h2_pvalue_violin, ncol=1, labels=c("a", "b")), width=7.2, height=6.5, units="in")
+
+
+
+#####################
+# Figure 4: Correlation calibration (deciles of the plug-in expected correlation sqrt(V), V = variance of the prediction in the held-out
+# individuals), single fold
+#####################
+fold_summary_df = compute_decile_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], "expected_r_plugin", "observed_r", n_bins)
+fold_plot = make_calibration_plot(fold_summary_df, "Expected correlation", "Observed held-out correlation")
+output_file = paste0(viz_dir, tissue, "_correlation_calibration_plugin_deciles_fold_", single_fold, ".pdf")
+ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 5: Correlation calibration (deciles of the plug-in expected correlation), one panel per fold
+#####################
+by_fold_summary_df = compute_decile_summary_df_by_fold(gene_fold_df, "expected_r_plugin", "observed_r", n_bins, folds)
+by_fold_plot = make_calibration_plot(by_fold_summary_df, "Expected correlation", "Observed held-out correlation")
+output_file = paste0(viz_dir, tissue, "_correlation_calibration_plugin_deciles_by_fold.pdf")
+ggsave(output_file, by_fold_plot, width=7.2, height=3.0, units="in")
+
+
+
+#####################
+# Figure 6: Expression FSR calibration at FSR thresholds in heritable genes (training cis-h2 LRT p < fsr_threshold_heritable_pvalue_threshold),
+# single fold. Filled points: observed fraction of called genes with r < 0 (95% CI; number of genes called above). Open points: mean expression
+# FSR of the called genes (expected)
+#####################
+fsr_threshold_df = gene_fold_df[!is.na(gene_fold_df$cis_snp_h2_pvalue_train) & gene_fold_df$cis_snp_h2_pvalue_train < fsr_threshold_heritable_pvalue_threshold, ]
+fold_summary_df = compute_fsr_threshold_summary_df(fsr_threshold_df[fsr_threshold_df$fold == single_fold, ], "expression_FSR", fsr_thresholds)
+fold_plot = make_fsr_threshold_plot(fold_summary_df, "Expression FSR threshold (genes with FSR <= threshold)", "Fraction of called genes with observed r < 0")
+output_file = paste0(viz_dir, tissue, "_expression_fsr_threshold_calibration_heritable_p_", fsr_threshold_heritable_pvalue_threshold, "_fold_", single_fold, ".pdf")
+ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 7: As Figure 6, one panel per fold
+#####################
+by_fold_summary_df = compute_fsr_threshold_summary_df_by_fold(fsr_threshold_df, "expression_FSR", fsr_thresholds, folds)
+by_fold_plot = make_fsr_threshold_plot(by_fold_summary_df, "Expression FSR threshold (genes with FSR <= threshold)", "Fraction of called genes\nwith observed r < 0", label_size=2.2)
+output_file = paste0(viz_dir, tissue, "_expression_fsr_threshold_calibration_heritable_p_", fsr_threshold_heritable_pvalue_threshold, "_by_fold.pdf")
+ggsave(output_file, by_fold_plot, width=7.2, height=3.2, units="in")
+
+
+
+#####################
+# Figure 8: Histogram of genetic FSR (bins of 0.01), all genes, single fold
+#####################
+genetic_fsr_histogram = make_histogram(gene_fold_df[gene_fold_df$fold == single_fold, ], "genetic_FSR", 0.01, "Genetic FSR", "Number of genes")
+output_file = paste0(viz_dir, tissue, "_genetic_fsr_histogram_fold_", single_fold, ".pdf")
+ggsave(output_file, genetic_fsr_histogram, width=7.2, height=4.0, units="in")
+
+
+#####################
+# Figure 9: Heritability calibration (deciles of expected cis-h2, mean over posterior samples of the variance of genetic expression in the
+# held-out individuals) against held-out HE cis-h2, all genes, single fold
+#####################
+fold_summary_df = compute_decile_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], "expected_cis_h2", "cis_snp_h2_he_test", n_bins)
+fold_plot = make_calibration_plot(fold_summary_df, "Expected cis-h2 (held-out individuals)", "Held-out HE cis-h2")
+output_file = paste0(viz_dir, tissue, "_heritability_calibration_deciles_fold_", single_fold, ".pdf")
+ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 10: As Figure 9, one panel per fold
+#####################
+by_fold_summary_df = compute_decile_summary_df_by_fold(gene_fold_df, "expected_cis_h2", "cis_snp_h2_he_test", n_bins, folds)
+by_fold_plot = make_calibration_plot(by_fold_summary_df, "Expected cis-h2 (held-out individuals)", "Held-out HE cis-h2")
+output_file = paste0(viz_dir, tissue, "_heritability_calibration_deciles_by_fold.pdf")
+ggsave(output_file, by_fold_plot, width=7.2, height=3.0, units="in")
+
+
+
+#####################
+# Figure 11: Held-out HE cis-h2 against what the model predicts it to be (deciles of expected_cis_snp_h2_he_var_test, mean over posterior samples
+# of the expected HE slope u' W u in the held-out individuals, which weights effects by LD the way HE does), all genes, single fold. Neither axis
+# is multiplied by Var(y) (held-out Var(y) is about 1)
+#####################
+fold_summary_df = compute_decile_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], "expected_cis_snp_h2_he_var_test", "cis_snp_h2_he_test", n_bins)
+fold_plot = make_calibration_plot(fold_summary_df, "Model-predicted held-out HE cis-h2", "Held-out HE cis-h2")
+output_file = paste0(viz_dir, tissue, "_predicted_he_calibration_deciles_fold_", single_fold, ".pdf")
+ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 12: As Figure 11, one panel per fold
+#####################
+by_fold_summary_df = compute_decile_summary_df_by_fold(gene_fold_df, "expected_cis_snp_h2_he_var_test", "cis_snp_h2_he_test", n_bins, folds)
+by_fold_plot = make_calibration_plot(by_fold_summary_df, "Model-predicted held-out HE cis-h2", "Held-out HE cis-h2")
+output_file = paste0(viz_dir, tissue, "_predicted_he_calibration_deciles_by_fold.pdf")
+ggsave(output_file, by_fold_plot, width=7.2, height=3.0, units="in")
+
+
+
+#####################
+# Figure 13: Genetic correlation calibration with LD-corrected held-out HE (deciles of expected_genetic_r; see
+# compute_genetic_correlation_decile_summary_df), all genes, single fold
+#####################
+fold_summary_df = compute_genetic_correlation_decile_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], n_bins)
+fold_plot = make_calibration_plot(fold_summary_df, "Expected correlation with genetic expression", "Mean observed r /\nsqrt(LD-corrected HE h2)")
+output_file = paste0(viz_dir, tissue, "_genetic_correlation_calibration_ld_corrected_deciles_fold_", single_fold, ".pdf")
+ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 14: As Figure 13, one panel per fold
+#####################
+by_fold_summary_df = compute_genetic_correlation_decile_summary_df_by_fold(gene_fold_df, n_bins, folds)
+by_fold_plot = make_calibration_plot(by_fold_summary_df, "Expected correlation with genetic expression", "Mean observed r /\nsqrt(LD-corrected HE h2)")
+output_file = paste0(viz_dir, tissue, "_genetic_correlation_calibration_ld_corrected_deciles_by_fold.pdf")
+ggsave(output_file, by_fold_plot, width=7.2, height=3.0, units="in")
+
+
+
+#####################
+# Figure 17: Coverage of the posterior predictive intervals of the observed held-out correlation at each nominal level, all genes, single fold
+#####################
+fold_summary_df = compute_coverage_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], coverage_levels)
+fold_plot = make_calibration_plot(fold_summary_df, "Nominal level", "Empirical coverage") + scale_x_continuous(breaks=coverage_levels / 100)
+output_file = paste0(viz_dir, tissue, "_predictive_interval_coverage_fold_", single_fold, ".pdf")
+ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 18: As Figure 17, one panel per fold
+#####################
+by_fold_summary_df = compute_coverage_summary_df_by_fold(gene_fold_df, coverage_levels, folds)
+by_fold_plot = make_calibration_plot(by_fold_summary_df, "Nominal level", "Empirical coverage") + scale_x_continuous(breaks=coverage_levels / 100)
+output_file = paste0(viz_dir, tissue, "_predictive_interval_coverage_by_fold.pdf")
+ggsave(output_file, by_fold_plot, width=7.2, height=3.0, units="in")
+
+
+
+#####################
+# Figure 19: Coverage of the posterior predictive intervals of the observed held-out correlation (Figure 17) within deciles of the posterior
+# predictive expected correlation, at each nominal level, all genes, single fold. Shows whether the shortfall is spread over genes or sits in the
+# weakly or strongly predicted ones
+#####################
+decile_coverage_df = compute_coverage_by_decile_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], "expected_r", coverage_levels, n_bins)
+decile_coverage_plot = make_coverage_by_decile_plot(decile_coverage_df, "Expected correlation (decile mean)", "Empirical coverage")
+output_file = paste0(viz_dir, tissue, "_predictive_interval_coverage_by_expected_r_decile_fold_", single_fold, ".pdf")
+ggsave(output_file, decile_coverage_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 20: Mean observed held-out correlation of the top N genes under each ranking (top_n_rankings), all genes, single fold. Made with a linear
+# x axis (<tissue>_top_n_genes_mean_observed_r_fold_<k>.pdf) and a log x axis (..._log_x.pdf), which shows the top few hundred genes
+#####################
+fold_summary_df = compute_top_n_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], top_n_rankings, top_n_min_genes)
+for (log_x in c(FALSE, TRUE)) {
+	fold_plot = make_top_n_plot(fold_summary_df, "Top N genes", "Mean observed held-out correlation", log_x=log_x, legend_bottom=TRUE)
+	output_file = paste0(viz_dir, tissue, "_top_n_genes_mean_observed_r_fold_", single_fold, ifelse(log_x, "_log_x", ""), ".pdf")
+	ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+}
+
+
+
+#####################
+# Figure 21: As Figure 20, one panel per fold (linear and log x axis)
+#####################
+by_fold_summary_df = compute_top_n_summary_df_by_fold(gene_fold_df, top_n_rankings, top_n_min_genes, folds)
+for (log_x in c(FALSE, TRUE)) {
+	by_fold_plot = make_top_n_plot(by_fold_summary_df, "Top N genes", "Mean observed\nheld-out correlation", log_x=log_x)
+	output_file = paste0(viz_dir, tissue, "_top_n_genes_mean_observed_r_by_fold", ifelse(log_x, "_log_x", ""), ".pdf")
+	ggsave(output_file, by_fold_plot, width=7.2, height=4.0, units="in")
+}
+
+
+
+#####################
+# Figure 22: 1 - observed FSR (fraction of genes with observed r >= 0) of the top N genes under each ranking (top_n_rankings), all genes, single fold
+# The x axis is linear
+#####################
+fold_summary_df = compute_top_n_summary_df(gene_fold_df[gene_fold_df$fold == single_fold, ], top_n_rankings, top_n_min_genes, value_col="true_sign")
+fold_plot = make_top_n_plot(fold_summary_df, "Top N genes", "1 - observed FSR of the top N genes", log_x=FALSE, legend_bottom=TRUE)
+output_file = paste0(viz_dir, tissue, "_top_n_genes_one_minus_observed_fsr_fold_", single_fold, ".pdf")
+ggsave(output_file, fold_plot, width=7.2, height=4.5, units="in")
+
+
+
+#####################
+# Figure 23: As Figure 22, one panel per fold
+#####################
+by_fold_summary_df = compute_top_n_summary_df_by_fold(gene_fold_df, top_n_rankings, top_n_min_genes, folds, value_col="true_sign")
+by_fold_plot = make_top_n_plot(by_fold_summary_df, "Top N genes", "1 - observed FSR\nof the top N genes", log_x=FALSE)
+output_file = paste0(viz_dir, tissue, "_top_n_genes_one_minus_observed_fsr_by_fold.pdf")
+ggsave(output_file, by_fold_plot, width=7.2, height=4.0, units="in")
