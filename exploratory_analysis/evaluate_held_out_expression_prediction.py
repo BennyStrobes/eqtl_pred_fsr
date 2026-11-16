@@ -41,6 +41,14 @@ import posterior_beta_samples as pbs
 #       to 0, so neither the noise nor centering y adds to it), computed here with the W of the held-out genotypes, over the samples of expected_cis_h2.
 #       If it matches cis_snp_h2_he_var_test where expected_cis_h2 does not, the difference between HE and expected_cis_h2 is how HE weights LD
 # Genes whose prediction is constant in the held-out individuals (V = 0) get nan for the quantities that need V > 0.
+#
+# External test set (--test_expression_file, --test_genotype_sample_mapping_file, --plink_stem; README.md, section 7b): the same quantities with the
+# held-out fold replaced by other individuals, e.g. the African-ancestry GTEx individuals of the tissue. The fit, its training individuals and the
+# _train columns are unchanged. The test dosages are read from the plink files (the step 1 input holds only the tissue's EUR individuals), and
+# standardized with the training (EUR) mean and standard deviation like any held-out dosage; a test missing call is set to the training mean.
+# Their GRM, for the model-free _test cis-h2, uses the variants with no missing test call, standardized within the test individuals. The residual
+# variance sigma2_e^(s) of the fit is carried over unchanged. Genes without test expression are left out (one row per gene with test expression).
+# The fold column is still --held_out_fold (the fit used).
 
 coverage_levels = [80, 90, 95, 99]
 
@@ -73,6 +81,47 @@ def load_in_gibbs_input_summary(gibbs_input_summary_file):
         chrom_to_file[int(data[0].replace('chr', ''))] = data[1]
     f.close()
     return chrom_to_file
+
+
+def load_in_test_expression(expression_file, n_test_individuals):
+    # External test set: residualized, renormalized expression bed file (chrom, start, tss, gene_id, then one column per individual, in the order
+    # of the test genotype sample mapping file). Returns dictionary gene_id (no version) -> expression vector
+    gene_id_to_expression = {}
+    f = open(expression_file)
+    head_count = 0
+    for line in f:
+        data = line.rstrip('\n').split('\t')
+        if head_count == 0:
+            head_count += 1
+            if len(data) - 4 != n_test_individuals:
+                raise ValueError(expression_file + ' has ' + str(len(data) - 4) + ' individuals and the test genotype sample mapping ' + str(n_test_individuals))
+            continue
+        gene_id = data[3].split('.')[0]
+        if gene_id in gene_id_to_expression:
+            raise ValueError('repeated gene id in ' + expression_file + ': ' + gene_id)
+        gene_id_to_expression[gene_id] = np.asarray(data[4:]).astype(float)
+    f.close()
+    return gene_id_to_expression
+
+
+def load_in_plink_alt_dosage(plink_stem, chrom_num, variant_ids, genotype_indices_list, chunk_size=20000):
+    # Alt-allele dosage (nan for a missing call) of the given GTEx variant ids (chr_pos_ref_alt_b38, the ids of the step 1 input) in the individuals
+    # of each array of plink .fam rows in genotype_indices_list. Same convention as prepare_gtex_tissue_data_for_gibbs.py: GTEx bim a1 = ref and
+    # pandas_plink G counts a1, so the alt-allele dosage is 2 - G.
+    # Returns the ids found in the bim (bim order) and one n_individuals x n_found matrix per entry of genotype_indices_list
+    from pandas_plink import read_plink
+    (bim, fam, G) = read_plink(plink_stem + str(chrom_num), verbose=False)
+    bim_snp_ids = np.asarray(bim['snp']).astype(str)
+    rows = np.flatnonzero(np.isin(bim_snp_ids, np.asarray(variant_ids)))
+    if len(np.unique(bim_snp_ids[rows])) != len(rows):
+        raise ValueError('repeated variant ids in ' + plink_stem + str(chrom_num) + '.bim')
+    dosage_chunks = [[] for indices in genotype_indices_list]
+    for chunk_start in range(0, len(rows), chunk_size):
+        geno_mat = G[rows[chunk_start:chunk_start + chunk_size], :].compute()
+        for k, indices in enumerate(genotype_indices_list):
+            dosage_chunks[k].append(2.0 - geno_mat[:, indices])
+    dosages = [np.transpose(np.concatenate(chunks, axis=0)) if len(chunks) > 0 else np.zeros((len(indices), 0)) for chunks, indices in zip(dosage_chunks, genotype_indices_list)]
+    return bim_snp_ids[rows], dosages
 
 
 def compute_cis_grm(genotype_mat):
@@ -251,7 +300,14 @@ parser.add_argument('--seed', type=int, default=1)
 # expression_FSR, with blocks of 250 all of it
 parser.add_argument('--block_size', type=int, default=250)
 parser.add_argument('--split_samples', action='store_true')  # y_hat from the even blocks, expected quantities from the odd blocks
+# External test set in place of the held-out fold (see top of file); all three or none
+parser.add_argument('--test_expression_file', type=str, default=None)  # residualized, renormalized expression bed file of the test individuals
+parser.add_argument('--test_genotype_sample_mapping_file', type=str, default=None)  # plink .fam row of each test expression column, in order
+parser.add_argument('--plink_stem', type=str, default=None)  # chromosome-specific plink files: <plink_stem><chrom_num>.{bed,bim,fam}
 args = parser.parse_args()
+external_test = args.test_expression_file is not None
+if external_test and (args.test_genotype_sample_mapping_file is None or args.plink_stem is None):
+    raise ValueError('--test_expression_file needs --test_genotype_sample_mapping_file and --plink_stem')
 
 np.random.seed(args.seed)
 samples = pbs.load_posterior_beta_samples(args.gibbs_results_stem + '_posterior_beta_samples.npz')
@@ -264,6 +320,11 @@ gene_ids = samples['gene_ids'].astype(str)
 gene_chroms = samples['gene_chroms']
 train_individual_ids = samples['train_individual_ids'].astype(str)
 print(str(len(gene_ids)) + ' genes, ' + str(samples['n_samples']) + ' retained samples', flush=True)
+if external_test:
+    test_genotype_indices = np.atleast_1d(np.loadtxt(args.test_genotype_sample_mapping_file)).astype(int)
+    test_gene_id_to_expression = load_in_test_expression(args.test_expression_file, len(test_genotype_indices))
+    print('external test set: ' + str(len(test_genotype_indices)) + ' individuals, ' + str(len(test_gene_id_to_expression)) + ' genes with expression, ' +
+          str(np.sum(np.isin(gene_ids, list(test_gene_id_to_expression.keys())))) + ' of the ' + str(len(gene_ids)) + ' fitted genes', flush=True)
 
 # Open output file handle
 columns = ['gene_id', 'chrom', 'fold', 'n_train', 'n_test', 'n_cis_variants', 'n_cis_variants_found', 'sum_pip', 'max_pip', 'expected_n_slab1', 'expected_n_slab2',
@@ -283,6 +344,8 @@ t = tempfile.NamedTemporaryFile(mode='w', suffix='_held_out_evaluation.txt', del
 t.write('\t'.join(columns) + '\n')
 
 ptr = samples['gene_pair_ptr']
+n_genes_written = 0
+n_genes_skipped = 0  # external test set: fitted genes without test expression
 for chrom_num in np.unique(gene_chroms):
     gibbs_input = np.load(chrom_to_file[chrom_num])
     folds = np.asarray([genotype_index_to_fold[genotype_index][1] for genotype_index in gibbs_input['genotype_indices']])
@@ -297,24 +360,52 @@ for chrom_num in np.unique(gene_chroms):
     chrom_gene_id_to_index = {gene_id: index for index, gene_id in enumerate(gibbs_input['gene_ids'].astype(str))}
     expression = gibbs_input['expression']
     chrom_gene_indices = np.flatnonzero(gene_chroms == chrom_num)
-    print('chr' + str(chrom_num) + ': ' + str(len(chrom_gene_indices)) + ' genes, ' + str(np.sum(train)) + ' training and ' + str(np.sum(test)) + ' held-out individuals', flush=True)
+    if external_test:
+        if len(np.intersect1d(test_genotype_indices, gibbs_input['genotype_indices'])) > 0:
+            raise ValueError('test individuals overlap the individuals of the gibbs input')
+        # Test dosages of the fit's variants on this chromosome. The same variants are also read for the gibbs input individuals and checked
+        # against the gibbs input genotype, which checks the allele orientation and the plink rows
+        chrom_model_variant_ids = np.unique(np.concatenate([pbs.gene_variant_ids(samples, g) for g in chrom_gene_indices]))
+        test_variant_ids, (test_chrom_dosage, gibbs_input_chrom_dosage) = load_in_plink_alt_dosage(args.plink_stem, chrom_num, chrom_model_variant_ids, [test_genotype_indices, gibbs_input['genotype_indices']])
+        gibbs_input_rows = np.asarray([variant_id_to_row[variant_id] for variant_id in test_variant_ids], dtype=int)
+        if np.array_equal(gibbs_input_chrom_dosage, np.transpose(genotype[gibbs_input_rows, :]).astype(float)) == False:
+            raise ValueError('chr' + str(chrom_num) + ': plink dosages of the gibbs input individuals differ from the gibbs input genotype')
+        del gibbs_input_chrom_dosage
+        test_variant_id_to_col = {variant_id: col for col, variant_id in enumerate(test_variant_ids)}
+        print('chr' + str(chrom_num) + ': ' + str(len(test_variant_ids)) + ' of ' + str(len(chrom_model_variant_ids)) + ' fitted variants in the plink files, test missing call rate ' +
+              '%.2g' % (np.mean(np.isnan(test_chrom_dosage)) if test_chrom_dosage.size > 0 else 0.0), flush=True)
+    n_test_print = len(test_genotype_indices) if external_test else np.sum(test)
+    print('chr' + str(chrom_num) + ': ' + str(len(chrom_gene_indices)) + ' genes, ' + str(np.sum(train)) + ' training and ' + str(n_test_print) + (' external test' if external_test else ' held-out') + ' individuals', flush=True)
     for g in chrom_gene_indices:
         gene_id = gene_ids[g]
+        if external_test and gene_id not in test_gene_id_to_expression:
+            n_genes_skipped += 1
+            continue
         variant_id_arr = pbs.gene_variant_ids(samples, g)
         # Dosages of the gene's variants, aligned through the variant ids (the route used for any other genotype data)
         rows = np.asarray([variant_id_to_row[variant_id] for variant_id in variant_id_arr if variant_id in variant_id_to_row], dtype=int)
         dosage = np.transpose(genotype[rows, :]).astype(float)
         aligned_dosage, found = pbs.align_dosage_to_gene_variants(variant_id_arr, chrom_variant_ids[rows], dosage)
         y_all = expression[chrom_gene_id_to_index[gene_id]]
-        y_test = y_all[test]
         y_train = y_all[train]
+        train_dosage = aligned_dosage[train]
+        if external_test:
+            y_test = test_gene_id_to_expression[gene_id]
+            cols = np.asarray([test_variant_id_to_col[variant_id] for variant_id in variant_id_arr if variant_id in test_variant_id_to_col], dtype=int)
+            test_dosage, test_found = pbs.align_dosage_to_gene_variants(variant_id_arr, test_variant_ids[cols], test_chrom_dosage[:, cols])
+        else:
+            y_test = y_all[test]
+            test_dosage, test_found = aligned_dosage[test], found
+        n_test = len(y_test)
+        # Variants of the test GRM: found, with no missing test call (all found variants for the held-out fold)
+        test_complete = test_found & (np.sum(np.isnan(test_dosage), axis=0) == 0)
 
-        # Observed and expected quantities in the held-out individuals
-        U_test = pbs.compute_genetic_value_samples(samples, g, aligned_dosage[test], found)
+        # Observed and expected quantities in the held-out (or external test) individuals
+        U_test = pbs.compute_genetic_value_samples(samples, g, test_dosage, test_found)
         out = compute_expected_quantities(U_test, samples['sigma2_e_samples'][:, g].astype(float), y_test, sample_block, args.split_samples)
 
         # Model-based training-fold cis-h2
-        U_train = pbs.compute_genetic_value_samples(samples, g, aligned_dosage[train], found)
+        U_train = pbs.compute_genetic_value_samples(samples, g, train_dosage, found)
         var_u_train = np.var(U_train, axis=1)
         out['posterior_cis_h2_train'] = np.mean(var_u_train)
         out['posterior_cis_h2_train_lb'] = np.quantile(var_u_train, 0.025)
@@ -322,22 +413,22 @@ for chrom_num in np.unique(gene_chroms):
 
         # The same with the correlations between variants set to 0, over the samples of expected_cis_h2 and of posterior_cis_h2_train
         expected_samples = sample_block % 2 == 1 if args.split_samples else np.ones(samples['n_samples'], dtype=bool)
-        out['expected_cis_h2_independent'] = np.mean(pbs.compute_independent_snp_h2_samples(samples, g, aligned_dosage[test], found)[expected_samples])
-        independent_h2_train = pbs.compute_independent_snp_h2_samples(samples, g, aligned_dosage[train], found)
+        out['expected_cis_h2_independent'] = np.mean(pbs.compute_independent_snp_h2_samples(samples, g, test_dosage, test_found)[expected_samples])
+        independent_h2_train = pbs.compute_independent_snp_h2_samples(samples, g, train_dosage, found)
         out['posterior_cis_h2_train_independent'] = np.mean(independent_h2_train)
         out['posterior_cis_h2_train_independent_lb'] = np.quantile(independent_h2_train, 0.025)
         out['posterior_cis_h2_train_independent_ub'] = np.quantile(independent_h2_train, 0.975)
 
-        # Model-free cis-h2 in the training and held-out individuals
-        for split, mask, y_split in [('train', train, y_train), ('test', test, y_test)]:
-            grm = compute_cis_grm(aligned_dosage[mask][:, found])
+        # Model-free cis-h2 in the training and held-out (or external test) individuals
+        for split, split_dosage, split_variants, y_split in [('train', train_dosage, found, y_train), ('test', test_dosage, test_complete, y_test)]:
+            grm = compute_cis_grm(split_dosage[:, split_variants])
             out['cis_snp_h2_' + split], out['cis_snp_h2_pvalue_' + split] = estimate_cis_snp_heritability_with_lrt(grm, y_split)
             out['cis_snp_h2_he_' + split], out['cis_snp_h2_he_se_' + split], out['cis_snp_h2_he_pvalue_' + split] = estimate_cis_snp_heritability_with_he_regression(grm, y_split)
             out['var_y_' + split] = np.var(y_split)  # the var_y that the HE estimate divides by
             out['cis_snp_h2_he_var_' + split] = out['cis_snp_h2_he_' + split] * out['var_y_' + split]
 
         # What the model predicts the held-out HE slope to be (see top of file); grm is the held-out GRM
-        he_weights = compute_he_weights(grm) if grm is not None and np.sum(test) >= 3 else None
+        he_weights = compute_he_weights(grm) if grm is not None and n_test >= 3 else None
         out['expected_cis_snp_h2_he_var_test'] = np.nan
         if he_weights is not None:
             U_expected = U_test[expected_samples] - np.mean(U_test[expected_samples], axis=1)[:, None]
@@ -348,16 +439,19 @@ for chrom_num in np.unique(gene_chroms):
         out['chrom'] = chrom_num
         out['fold'] = args.held_out_fold
         out['n_train'] = np.sum(train)
-        out['n_test'] = np.sum(test)
+        out['n_test'] = n_test
         out['n_cis_variants'] = len(variant_id_arr)
-        out['n_cis_variants_found'] = np.sum(found)
+        out['n_cis_variants_found'] = np.sum(test_found)
         out['sum_pip'] = np.sum(pip)
         out['max_pip'] = np.max(pip)
         out['expected_n_slab1'] = np.sum(samples['pair_p_slab1'][ptr[g]:ptr[g + 1]])
         out['expected_n_slab2'] = np.sum(samples['pair_p_slab2'][ptr[g]:ptr[g + 1]])
         t.write('\t'.join(str(out[column]) for column in columns) + '\n')
+        n_genes_written += 1
     t.flush()
     gibbs_input.close()
+    if external_test:
+        del test_chrom_dosage
 t.close()
 shutil.copyfile(t.name, args.output_file)
 os.remove(t.name)
@@ -368,9 +462,11 @@ with open(args.output_file, 'rb') as f:
 if b'\0' in content:
     raise ValueError('output file contains NUL bytes: ' + args.output_file)
 lines = content.decode().rstrip('\n').split('\n')
-if len(lines) != len(gene_ids) + 1:
-    raise ValueError('output file has ' + str(len(lines) - 1) + ' rows for ' + str(len(gene_ids)) + ' genes: ' + args.output_file)
+if n_genes_written + n_genes_skipped != len(gene_ids) or (external_test == False and n_genes_skipped > 0):
+    raise ValueError(str(n_genes_written) + ' genes written and ' + str(n_genes_skipped) + ' left out of ' + str(len(gene_ids)))
+if len(lines) != n_genes_written + 1:
+    raise ValueError('output file has ' + str(len(lines) - 1) + ' rows for ' + str(n_genes_written) + ' genes: ' + args.output_file)
 for line_num, line in enumerate(lines):
     if len(line.split('\t')) != len(columns):
         raise ValueError('line ' + str(line_num + 1) + ' of ' + args.output_file + ' does not have ' + str(len(columns)) + ' columns')
-print('wrote and checked ' + str(len(gene_ids)) + ' rows', flush=True)
+print('wrote and checked ' + str(n_genes_written) + ' rows' + (' (' + str(n_genes_skipped) + ' fitted genes without test expression left out)' if external_test else ''), flush=True)

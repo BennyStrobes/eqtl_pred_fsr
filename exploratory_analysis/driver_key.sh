@@ -18,6 +18,10 @@ gtex_expression_dir=${gtex_processing_dir}"residualized_expression/"
 gtex_genotype_dir=${gtex_processing_dir}"plink_processed_genotype/"
 gtex_plink_stem=${gtex_genotype_dir}"gtex_v9_eqtl_chr"
 
+# African-ancestry (AFR) individuals (from gdl_uncertainty_paper/gtex_eqtl_expression_processing/driver_key.sh, Part B): residualized expression with
+# covariates fit on all samples of the tissue, then standardized within AFR (${tissue}.v8_afr.residualized_expression_renormalized.bed), and the
+# plink .fam row of each of its columns (genotype_sample_mapping_to_${tissue}_afr_expression_samples.txt); set in steps 5 and 6
+
 # Protein-coding genes
 gtex_pc_genes_gtf="/lab-share/CHIP-Strober-e2/Public/gene_annotation_files/gencode.v39.gtex.protein_coding.genes.gtf"
 
@@ -37,6 +41,10 @@ gibbs_results_dir=${output_root}"gibbs_results/"
 held_out_evaluation_dir=${output_root}"held_out_evaluation/"
 
 visualization_dir=${output_root}"visualization/"
+
+afr_evaluation_dir=${output_root}"afr_evaluation/"
+
+afr_visualization_dir=${output_root}"visualization_afr/"
 
 
 #####################
@@ -145,5 +153,38 @@ fi
 if false; then
 for model_label in ${gene_class_model_labels}; do
 	sbatch visualize_gene_classes.sh ${tissue}${model_label} ${n_folds} ${gibbs_results_dir} ${visualization_dir} _split_samples
+done
+fi
+
+
+
+
+#####################
+# 5. Evaluate the fits of one fold in the African-ancestry individuals of the tissue (README.md, section 7b), every model (after step 2). The fits were
+# trained on EUR individuals; AFR dosages are standardized with the EUR training mean and standard deviation of each variant, the residual variances
+# of the fit are carried over, and the columns are those of step 3 (_test = AFR)
+#####################
+afr_fold="3"
+afr_expression_file=${gtex_expression_dir}${tissue}".v8_afr.residualized_expression_renormalized.bed"
+afr_genotype_sample_mapping_file=${gtex_genotype_dir}"genotype_sample_mapping_to_"${tissue}"_afr_expression_samples.txt"
+if false; then
+mkdir -p ${afr_evaluation_dir}
+for model_label in ${model_labels}; do
+	sbatch evaluate_external_expression_prediction.sh ${gibbs_input_summary_file} ${fold_file} ${afr_fold} ${gibbs_results_dir}${tissue}${model_label}"_fold_"${afr_fold} ${afr_expression_file} ${afr_genotype_sample_mapping_file} ${gtex_plink_stem} ${afr_evaluation_dir}${tissue}${model_label}"_fold_"${afr_fold}"_afr_evaluation_split_samples.txt" split_samples
+done
+fi
+
+
+
+#####################
+# 6. For every model, plots of its AFR evaluation (README.md, section 8, plot 10; after step 5, and step 3 for fold ${afr_fold}): the step 4 plots,
+# named ${tissue}${model_label}_afr_split_samples_*, and EUR held-out against AFR, named ${tissue}${model_label}_afr_vs_eur_split_samples_*
+#####################
+model_label="_grid_classes_gwfm"
+sh organize_and_visualize_afr_results.sh ${tissue}${model_label} ${afr_fold} ${gibbs_results_dir} ${held_out_evaluation_dir} ${afr_evaluation_dir} ${afr_visualization_dir} _split_samples
+
+if false; then
+for model_label in ${model_labels}; do
+	sbatch organize_and_visualize_afr_results.sh ${tissue}${model_label} ${afr_fold} ${gibbs_results_dir} ${held_out_evaluation_dir} ${afr_evaluation_dir} ${afr_visualization_dir} _split_samples
 done
 fi
